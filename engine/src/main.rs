@@ -337,6 +337,7 @@ struct CRec {
     ck: u64,
     ts: u32, // ms since window_start - 7 days
     camp: u32,
+    _p: u64,
 }
 
 #[inline(always)]
@@ -427,7 +428,7 @@ fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
     });
 }
 
-fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut [Vec<CRec>], ovf: &mut Ovf, tmp: &mut Vec<CRec>) {
+fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut part::Parts<CRec>, ovf: &mut Ovf, tmp: &mut Vec<CRec>) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     tmp.clear();
@@ -445,7 +446,7 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut [Vec
         };
         let ck = ids::key(f[0], ovf);
         let uk = ids::key(f[1], ovf);
-        tmp.push(CRec { pk: uk, ck, ts: (t - lo) as u32, camp });
+        tmp.push(CRec { pk: uk, ck, ts: (t - lo) as u32, camp, _p: 0 });
     });
     const D: usize = 16;
     for i in 0..tmp.len() {
@@ -454,7 +455,7 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut [Vec
         }
         let mut r = tmp[i];
         r.pk = links.get(r.pk);
-        out[bucket(r.pk, shift)].push(r);
+        out.push(bucket(r.pk, shift), r);
     }
 }
 
@@ -594,7 +595,7 @@ fn dedup_bucket(
     shift: u32,
     table: &mut Vec<(u64, *const EvRec)>,
     win: &mut Vec<PRec>,
-    out: &mut [Vec<PRec>],
+    out: &mut part::Parts<PRec>,
 ) {
     let n: usize = ev.iter().map(|t| t.len(b)).sum();
     if n == 0 {
@@ -647,7 +648,7 @@ fn dedup_bucket(
         }
         let mut r = win[i];
         r.pk = links.get(r.pk);
-        out[bucket(r.pk, shift)].push(r);
+        out.push(bucket(r.pk, shift), r);
     }
 }
 
@@ -720,15 +721,15 @@ impl Work {
 
 fn person_bucket(
     b: usize,
-    pev: &[Vec<Vec<PRec>>],
-    pcl: &[Vec<Vec<CRec>>],
+    pev: &[part::Parts<PRec>],
+    pcl: &[part::Parts<CRec>],
     ctx: &Ctx,
     pool: &Pool,
     w: &mut Work,
     acc: &mut Acc,
     uo: &mut UserOut,
 ) {
-    let nev: usize = pev.iter().map(|t| t[b].len()).sum();
+    let nev: usize = pev.iter().map(|t| t.len(b)).sum();
     if nev == 0 {
         return;
     }
@@ -741,7 +742,8 @@ fn person_bucket(
     w.cnt.clear();
     w.pks.clear();
     for t in pev {
-        for r in &t[b] {
+        let (x1, x2) = t.get(b);
+        for r in x1.iter().chain(x2) {
             let mut i = ids::mix(r.pk) as usize & mask;
             let lid = loop {
                 let s = unsafe { w.tab.get_unchecked_mut(i) };
@@ -789,7 +791,8 @@ fn person_bucket(
         let mut pos: Vec<u32> = w.off[..np].to_vec();
         let mut j = 0;
         for t in pev {
-            for r in &t[b] {
+            let (x1, x2) = t.get(b);
+            for r in x1.iter().chain(x2) {
                 let l = w.lids[j] as usize;
                 j += 1;
                 w.sorted[pos[l] as usize] = ((r.ts as u64) << 32) | r.pc as u64;
@@ -802,7 +805,8 @@ fn person_bucket(
     w.ccnt.clear();
     w.ccnt.resize(np, 0);
     for t in pcl {
-        for c in &t[b] {
+        let (x1, x2) = t.get(b);
+        for c in x1.iter().chain(x2) {
             let mut i = ids::mix(c.pk) as usize & mask;
             let lid = loop {
                 let s = unsafe { w.tab.get_unchecked(i) };
@@ -833,7 +837,8 @@ fn person_bucket(
         let mut pos: Vec<u32> = w.coff[..np].to_vec();
         let mut j = 0;
         for t in pcl {
-            for c in &t[b] {
+            let (x1, x2) = t.get(b);
+            for c in x1.iter().chain(x2) {
                 let l = w.clid[j];
                 j += 1;
                 if l == u32::MAX {
@@ -1168,12 +1173,14 @@ fn main() {
     let next = AtomicUsize::new(0);
     let ntasks = cl_chunks.len() + nb;
     let pper = est_events / nt / nb + 32;
-    let d_parts: Vec<(Vec<Vec<PRec>>, Vec<Vec<CRec>>, Ovf)> = std::thread::scope(|s| {
+    let cl_bytes: usize = cl_files.iter().map(|d| d.len()).sum();
+    let cper = cl_bytes / 48 / nt / nb * 3 / 2 + 32;
+    let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, Ovf)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
-                    let mut pe: Vec<Vec<PRec>> = (0..nb).map(|_| Vec::with_capacity(pper)).collect();
-                    let mut pc: Vec<Vec<CRec>> = (0..nb).map(|_| Vec::new()).collect();
+                    let mut pe = part::Parts::<PRec>::new(nb, pper * 3 / 2);
+                    let mut pc = part::Parts::<CRec>::new(nb, cper);
                     let mut o = Ovf::new();
                     let mut table = Vec::new();
                     let mut win = Vec::new();
@@ -1194,6 +1201,8 @@ fn main() {
                         }
                         if is_click { tc += tt.elapsed().as_secs_f64(); } else { td += tt.elapsed().as_secs_f64(); }
                     }
+                    pe.finish();
+                    pc.finish();
                     (pe, pc, o)
                 })
             })
@@ -1212,7 +1221,7 @@ fn main() {
     }
 
     // P: person buckets, largest first
-    let mut order: Vec<(usize, usize)> = (0..nb).map(|b| (pev.iter().map(|t| t[b].len()).sum::<usize>(), b)).collect();
+    let mut order: Vec<(usize, usize)> = (0..nb).map(|b| (pev.iter().map(|t| t.len(b)).sum::<usize>(), b)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");

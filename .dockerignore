@@ -1,0 +1,8 @@
+target
+**/target
+kit
+dev
+out*
+notes
+.git
+reference

@@ -8,3 +8,4 @@
 /bench/
 __pycache__/
 *.parquet
+notes/*.local.md

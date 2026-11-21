@@ -386,25 +386,19 @@ fn parse_events_g<const PUSH: bool>(c: Chunk, ctx: &Ctx, shift: u32, out: &mut p
         let ing_ms = ts::parse(f[3]).unwrap_or(i64::MAX);
         let ing = if ing_ms >= 0 && ing_ms / 1000 < u32::MAX as i64 { (ing_ms / 1000) as u32 } else { u32::MAX };
         let mut r = EvRec { eid, user: 0, ing, ts: u32::MAX, pc: 0, _p: 0 };
-        'valid: {
-            if f[1].is_empty() || f[5].is_empty() {
-                break 'valid;
+        let (tok, t) = ts::parse_window(f[2]);
+        let ty = event_type(f[4]); // 0 bad, 1 view/cart, 2 purchase
+        let mut price = 0u32;
+        let mut pok = ty == 1;
+        if ty == 2 {
+            if let Some(p) = parse_price(f[6]) {
+                price = p;
+                pok = true;
             }
-            let t = match ts::parse(f[2]) {
-                Some(t) if t >= ws && t < we => t,
-                _ => break 'valid,
-            };
-            let price = match f[4] {
-                b"view" | b"cart" => 0,
-                b"purchase" => match parse_price(f[6]) {
-                    Some(p) => p,
-                    None => break 'valid,
-                },
-                _ => break 'valid,
-            };
-            if ing_ms != i64::MAX && ing_ms - t > DAY {
-                break 'valid;
-            }
+        }
+        let late = (ing_ms != i64::MAX) & (ing_ms.wrapping_sub(t) > DAY);
+        let valid = !f[1].is_empty() & !f[5].is_empty() & tok & (t >= ws) & (t < we) & pok & !late;
+        if valid {
             r.user = ids::key(f[1], ovf);
             r.ts = (t - ws) as u32;
             r.pc = (price << 8) | ctx.cat_of(f[5]) as u32;
@@ -415,6 +409,26 @@ fn parse_events_g<const PUSH: bool>(c: Chunk, ctx: &Ctx, shift: u32, out: &mut p
             std::hint::black_box(r);
         }
     });
+}
+
+/// 1 for `view` or `cart`, 2 for `purchase`, 0 for anything else.
+#[inline(always)]
+fn event_type(t: &[u8]) -> u32 {
+    let p = t.as_ptr();
+    if t.len() > 8 || (p as usize & 4095) > 4096 - 8 {
+        return match t {
+            b"view" | b"cart" => 1,
+            b"purchase" => 2,
+            _ => 0,
+        };
+    }
+    let w = unsafe { std::ptr::read_unaligned(p as *const u64) };
+    let n = t.len();
+    let m = if n == 8 { !0u64 } else { (1u64 << (8 * n)) - 1 };
+    let w = w & m;
+    let vc = (n == 4) & ((w == u32::from_le_bytes(*b"view") as u64) | (w == u32::from_le_bytes(*b"cart") as u64));
+    let pu = (n == 8) & (w == u64::from_le_bytes(*b"purchase"));
+    vc as u32 | ((pu as u32) << 1)
 }
 
 fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
@@ -440,10 +454,10 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut part
             Some(x) => x,
             None => return,
         };
-        let t = match ts::parse(f[3]) {
-            Some(t) if t >= lo && t < hi => t,
-            _ => return,
-        };
+        let (tok, t) = ts::parse_window(f[3]);
+        if !(tok & (t >= lo) & (t < hi)) {
+            return;
+        }
         let ck = ids::key(f[0], ovf);
         let uk = ids::key(f[1], ovf);
         tmp.push(CRec { pk: uk, ck, ts: (t - lo) as u32, camp, _p: 0 });

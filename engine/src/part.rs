@@ -2,9 +2,9 @@
 //! buffer, flushed to the partition's region with non-temporal stores (no read-for-ownership).
 //! Partitions that outgrow their region continue in an overflow Vec.
 
-#[repr(C, align(64))]
+#[repr(C, align(128))]
 #[derive(Clone, Copy)]
-struct Line([u8; 64]);
+struct Line([u8; 128]);
 
 pub struct Parts<T: Copy> {
     k: usize,           // records per line
@@ -20,8 +20,8 @@ pub struct Parts<T: Copy> {
 impl<T: Copy> Parts<T> {
     pub fn new(nparts: usize, cap_hint: usize) -> Self {
         let sz = std::mem::size_of::<T>();
-        assert!(sz > 0 && 64 % sz == 0, "record size must divide 64");
-        let k = 64 / sz;
+        assert!(sz > 0 && 128 % sz == 0, "record size must divide 128");
+        let k = 128 / sz;
         let cap = ((cap_hint + k - 1) / k * k).max(k);
         let lines = nparts * cap / k;
         let mut region = Vec::with_capacity(lines);
@@ -31,7 +31,7 @@ impl<T: Copy> Parts<T> {
             cap,
             region,
             count: vec![0; nparts],
-            wc: vec![Line([0; 64]); nparts],
+            wc: vec![Line([0; 128]); nparts],
             wcn: vec![0; nparts],
             overflow: (0..nparts).map(|_| Vec::new()).collect(),
             _t: std::marker::PhantomData,
@@ -60,6 +60,7 @@ impl<T: Copy> Parts<T> {
             let dst = self.region.as_mut_ptr().add((p * self.cap + c) / self.k) as *mut u8;
             let src = self.wc.get_unchecked(p).0.as_ptr();
             stream64(dst, src);
+            stream64(dst.add(64), src.add(64));
             *self.count.get_unchecked_mut(p) = (c + self.k) as u32;
         } else {
             let line = self.wc.get_unchecked(p).0.as_ptr() as *const T;

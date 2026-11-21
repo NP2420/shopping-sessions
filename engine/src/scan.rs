@@ -46,16 +46,19 @@ fn bits_from(i: u32) -> u64 {
     }
 }
 
-/// Unquote fields in place; `q` is the number of quotes in the line.
+/// Unquote fields in place, without branching per field; `q` is the number of quotes in the line.
 #[inline(always)]
 fn unquote<const N: usize>(f: &mut [&[u8]; N], q: u32) -> bool {
     let mut stripped = 0u32;
     for x in f.iter_mut() {
         let l = x.len();
-        if l >= 2 && x[0] == b'"' && x[l - 1] == b'"' {
-            *x = &x[1..l - 1];
-            stripped += 2;
-        }
+        let p = x.as_ptr();
+        // first and last byte; for an empty field both reads are of byte 0 of a valid line or
+        // the separator after it, and the length test below rejects it anyway
+        let (a, z) = if l == 0 { (0u8, 0u8) } else { unsafe { (*p, *p.add(l - 1)) } };
+        let w = ((a == b'"') & (z == b'"') & (l >= 2)) as usize;
+        *x = unsafe { std::slice::from_raw_parts(p.add(w), l - 2 * w) };
+        stripped += 2 * w as u32;
     }
     stripped == q
 }

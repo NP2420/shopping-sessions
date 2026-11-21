@@ -223,6 +223,61 @@ pub fn parse(f: &[u8]) -> Option<i64> {
     parse_slow(f)
 }
 
+
+#[inline(always)]
+unsafe fn ldp(p: *const u8, i: usize) -> u64 {
+    std::ptr::read_unaligned(p.add(i) as *const u64)
+}
+
+/// For event and click `ts` fields: F1 and F3 resolved without branching on the form, with F2 and
+/// anything unusual on the exact path. Returns (ok, ms). Years outside the calendar table come
+/// back as not ok, which callers treat like any timestamp outside the window.
+#[inline(always)]
+pub fn parse_window(f: &[u8]) -> (bool, i64) {
+    let n = f.len();
+    let p = f.as_ptr();
+    if (n != 13 && n != 20) || (p as usize & 4095) > 4096 - 24 {
+        return match parse(f) {
+            Some(v) => (true, v),
+            None => (false, 0),
+        };
+    }
+    unsafe {
+        let a = ldp(p, 0);
+        let a5 = ldp(p, 5);
+        let b = ldp(p, 8);
+        let c = ldp(p, 11);
+        let z = *p.add(19);
+        // F3: 13 digits
+        let f3_ok = (n == 13) & swar_all_digits(a, !0) & swar_all_digits(a5, !0);
+        let f3 = (swar8(a) * 100_000 + swar8((a5 >> 24) << 24 | 0x0030_3030)) as i64;
+        // F1
+        const SA: u64 = 0xFF00_00FF_0000_0000;
+        const SB: u64 = 0x0000_0000_00FF_0000;
+        const SC: u64 = 0x0000_FF00_00FF_0000;
+        let sep = (a & SA == 0x2D00_002D_0000_0000) & (b & SB == 0x0000_0000_0054_0000) & (c & SC == 0x0000_3A00_003A_0000);
+        let dig = swar_all_digits(a, !SA) & swar_all_digits(b, 0x0000_0000_0000_FFFF) & swar_all_digits(c, !SC);
+        let d = |x: u64, i: u32| -> i64 { ((x >> (8 * i)) & 0xF) as i64 };
+        let y = d(a, 0) * 1000 + d(a, 1) * 100 + d(a, 2) * 10 + d(a, 3);
+        let mo = d(a, 5) * 10 + d(a, 6);
+        let dd = d(b, 0) * 10 + d(b, 1);
+        let h = d(c, 0) * 10 + d(c, 1);
+        let mi = d(c, 3) * 10 + d(c, 4);
+        let s = d(c, 6) * 10 + d(c, 7);
+        let yi = y - Y0;
+        let yok = (yi >= 0) & (yi < NY as i64);
+        let moi = mo.clamp(0, 12) as usize;
+        let yc = yi.clamp(0, NY as i64 - 1) as usize;
+        let cal = cal();
+        let ml = *cal.len.get_unchecked(yc).get_unchecked(moi) as i64;
+        let st = *cal.start.get_unchecked(yc).get_unchecked(moi) as i64;
+        let f1_ok = (n == 20) & (z == b'Z') & sep & dig & yok & (mo >= 1) & (mo <= 12) & (dd >= 1) & (dd <= ml) & (h <= 23) & (mi <= 59) & (s <= 59);
+        let f1 = (st + dd - 1) * DAY_MS + (h * 3600 + mi * 60 + s) * 1000;
+        let v = if f3_ok { f3 } else { f1 };
+        (f3_ok | f1_ok, v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +321,16 @@ mod tests {
                 v[i] = if r % 3 == 0 { alphabet[(r as usize / 3) % alphabet.len()] } else { b'0' + ((r >> 8) % 10) as u8 };
             }
             assert_eq!(parse(&v), parse_slow(&v), "{}", String::from_utf8_lossy(&v));
+            let mut padded = v.clone();
+            padded.extend_from_slice(b",2026-10-03T23:58:10Z,xxxxxxxx");
+            let (ok, w) = parse_window(&padded[..v.len()]);
+            let exact = parse_slow(&v);
+            if ok {
+                assert_eq!(Some(w), exact, "{}", String::from_utf8_lossy(&v));
+            } else if let Some(t) = exact {
+                // only out-of-table years may be reported as not ok
+                assert!(t < -2_208_988_800_000 || t >= 10_413_792_000_000, "{} {t}", String::from_utf8_lossy(&v));
+            }
         }
     }
 }

@@ -1,0 +1,10 @@
+/target/
+**/target/
+/kit/
+*.zip
+/dev/
+/data/
+/out*/
+/bench/
+__pycache__/
+*.parquet

@@ -219,33 +219,63 @@ fn build_ctx(data: &Path) -> Ctx {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
 
-    let prows = read_small(&data.join("products.csv"), 2);
-    let mut cats: Vec<Vec<u8>> = prows.iter().map(|r| r[1].clone()).collect();
+    // products: one pass collecting (product, raw category index), then sort category names
+    let pd = map_file(&data.join("products.csv"));
+    let mut raw_cats: Vec<&'static [u8]> = Vec::new();
+    let mut rows: Vec<(&'static [u8], u32)> = Vec::with_capacity(pd.len() / 14 + 1);
+    let mut last: (&[u8], u32) = (&[], u32::MAX);
+    let mut cat_map: HashMap<&'static [u8], u32> = HashMap::new();
+    scan::lines::<2>(pd, 0, pd.len(), |f| {
+        let c = f[1];
+        let ci = if last.1 != u32::MAX && last.0 == c {
+            last.1
+        } else {
+            let ci = if raw_cats.len() < 64 {
+                match raw_cats.iter().position(|&x| x == c) {
+                    Some(i) => i as u32,
+                    None => {
+                        raw_cats.push(c);
+                        cat_map.insert(c, (raw_cats.len() - 1) as u32);
+                        (raw_cats.len() - 1) as u32
+                    }
+                }
+            } else {
+                *cat_map.entry(c).or_insert_with(|| {
+                    raw_cats.push(c);
+                    (raw_cats.len() - 1) as u32
+                })
+            };
+            last = (c, ci);
+            ci
+        };
+        rows.push((f[0], ci));
+    });
+    let mut cats: Vec<Vec<u8>> = raw_cats.iter().map(|c| c.to_vec()).collect();
     cats.push(b"unknown".to_vec());
     cats.sort();
     cats.dedup();
     if cats.len() > 255 {
         die("more than 254 categories");
     }
-    let cidx: HashMap<Vec<u8>, u8> = cats.iter().enumerate().map(|(i, c)| (c.clone(), i as u8)).collect();
-    let unknown = cidx[&b"unknown".to_vec()];
+    let remap: Vec<u8> = raw_cats.iter().map(|c| cats.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u8).collect();
+    let unknown = cats.binary_search(&b"unknown".to_vec()).unwrap() as u8;
     let mut prod_tab = Vec::new();
     let mut prod_map = HashMap::new();
-    for r in &prows {
-        if r[0].is_empty() {
+    for &(pid, ci) in &rows {
+        if pid.is_empty() {
             continue;
         }
-        let c = cidx[&r[1]];
-        if let Some(n) = canon_num(&r[0], b"p") {
+        let c = remap[ci as usize];
+        if let Some(n) = canon_num(pid, b"p") {
             if n < 50_000_000 {
                 if prod_tab.len() <= n {
-                    prod_tab.resize(n + 1, 255u8);
+                    prod_tab.resize((n + 1).max(prod_tab.len() * 2).min(50_000_000), 255u8);
                 }
                 prod_tab[n] = c;
                 continue;
             }
         }
-        prod_map.insert(r[0].clone(), c);
+        prod_map.insert(pid.to_vec(), c);
     }
 
     let crows = read_small(&data.join("campaigns.csv"), 2);

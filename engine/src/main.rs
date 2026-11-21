@@ -8,6 +8,7 @@
 
 mod arena;
 mod ids;
+mod part;
 mod pq;
 mod scan;
 mod ts;
@@ -368,7 +369,12 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut [Vec<EvRec>], ovf: &mut Ovf) {
+fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &mut Ovf) {
+    parse_events_g::<true>(c, ctx, shift, out, ovf)
+}
+
+#[inline(always)]
+fn parse_events_g<const PUSH: bool>(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &mut Ovf) {
     let ws = ctx.ws;
     let we = ctx.we;
     scan::lines::<7>(c.data, c.start, c.end, |f| {
@@ -402,7 +408,11 @@ fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut [Vec<EvRec>], ovf: &m
             r.ts = (t - ws) as u32;
             r.pc = (price << 8) | ctx.cat_of(f[5]) as u32;
         }
-        out[bucket(eid, shift)].push(r);
+        if PUSH {
+            out.push(bucket(eid, shift), r);
+        } else {
+            std::hint::black_box(r);
+        }
     });
 }
 
@@ -579,14 +589,14 @@ fn try_links(edges: &[Vec<(u64, u64)>], pool: &Pool, cap: usize) -> Option<LinkT
 
 fn dedup_bucket(
     b: usize,
-    ev: &[Vec<Vec<EvRec>>],
+    ev: &[part::Parts<EvRec>],
     links: &LinkTab,
     shift: u32,
     table: &mut Vec<(u64, *const EvRec)>,
     win: &mut Vec<PRec>,
     out: &mut [Vec<PRec>],
 ) {
-    let n: usize = ev.iter().map(|t| t[b].len()).sum();
+    let n: usize = ev.iter().map(|t| t.len(b)).sum();
     if n == 0 {
         return;
     }
@@ -595,7 +605,8 @@ fn dedup_bucket(
     table.clear();
     table.resize(cap, (EMPTY, std::ptr::null()));
     for t in ev {
-        let v = &t[b];
+      let (v1, v2) = t.get(b);
+      for v in [v1, v2] {
         for (j, r) in v.iter().enumerate() {
             if j + 8 < v.len() {
                 prefetch(unsafe { table.as_ptr().add(ids::mix(v.get_unchecked(j + 8).eid) as usize & mask) } as *const u8);
@@ -616,6 +627,7 @@ fn dedup_bucket(
                 i = (i + 1) & mask;
             }
         }
+      }
     }
     win.clear();
     for s in table.iter() {
@@ -992,6 +1004,65 @@ fn write_file(path: &Path, bytes: &[u8]) {
 
 // ---------------------------------------------------------------- main
 
+#[inline(never)]
+fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
+    // single-threaded micro benchmark over all event files (pages pre-touched)
+    let mut sum = 0u64;
+    for d in files {
+        for i in (0..d.len()).step_by(4096) {
+            sum = sum.wrapping_add(d[i] as u64);
+        }
+    }
+    let reps: usize = std::env::var("SS_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let mut best = f64::MAX;
+    let mut lines = 0u64;
+    for _ in 0..reps {
+    let t = std::time::Instant::now();
+    lines = 0;
+    let mut o = Ovf::new();
+    let mut b = part::Parts::<EvRec>::new(512, 50_000);
+    for &d in files {
+        let c = Chunk { data: d, start: 0, end: d.len() };
+        match mode {
+            "scan" => scan::lines::<7>(d, 0, d.len(), |f| {
+                lines += 1;
+                sum = sum.wrapping_add(f[2].len() as u64);
+            }),
+            "ts" => scan::lines::<7>(d, 0, d.len(), |f| {
+                lines += 1;
+                sum = sum.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64 ^ ts::parse(f[3]).unwrap_or(0) as u64);
+            }),
+            "ids" => scan::lines::<7>(d, 0, d.len(), |f| {
+                lines += 1;
+                if !f[0].is_empty() && !f[1].is_empty() {
+                    sum = sum.wrapping_add(ids::ident(f[0]) ^ ids::key(f[1], &mut o));
+                }
+            }),
+            "prod" => scan::lines::<7>(d, 0, d.len(), |f| {
+                lines += 1;
+                sum = sum.wrapping_add(ctx.cat_of(f[5]) as u64 + parse_price(f[6]).unwrap_or(0) as u64 + (f[4] == b"view") as u64);
+            }),
+            "nopush" => {
+                parse_events_g::<false>(c, ctx, 64 - 9, &mut b, &mut o);
+                lines += 1;
+            }
+            "parse" => {
+                parse_events(c, ctx, 64 - 9, &mut b, &mut o);
+            }
+            _ => {}
+        }
+    }
+    if mode == "parse" {
+        b.finish();
+        lines = (0..512).map(|p| b.len(p) as u64).sum();
+    }
+    best = best.min(t.elapsed().as_secs_f64());
+    }
+    let el = best;
+    eprintln!("{mode}: {lines} lines, {:.1} ns/line, {:.2} GB/s ({sum})", el * 1e9 / lines as f64, files.iter().map(|d| d.len()).sum::<usize>() as f64 / el / 1e9);
+    unsafe { libc::_exit(0) }
+}
+
 fn env_or_arg(name: &str, idx: usize, default: &str) -> PathBuf {
     if let Ok(v) = std::env::var(name) {
         return PathBuf::from(v);
@@ -1021,6 +1092,9 @@ fn main() {
     let cl_files: Vec<&'static [u8]> = csv_files(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let ln_files: Vec<&'static [u8]> = csv_files(&data.join("links")).iter().map(|p| map_file(p)).collect();
     let ev_bytes: usize = ev_files.iter().map(|d| d.len()).sum();
+    if let Ok(mode) = std::env::var("SS_BENCH") {
+        bench(&mode, &ev_files, &ctx);
+    }
     let all_bytes = ev_bytes + cl_files.iter().map(|d| d.len()).sum::<usize>();
     let csize = (all_bytes / (nt * 16)).clamp(256 << 10, 4 << 20);
     let ev_chunks = chunks_of(&ev_files, csize);
@@ -1062,12 +1136,12 @@ fn main() {
 
     // E: events, with union-find on its own thread
     let next = AtomicUsize::new(0);
-    let (ev_parts, links): (Vec<(Vec<Vec<EvRec>>, Ovf)>, LinkTab) = std::thread::scope(|s| {
+    let (ev_parts, links): (Vec<(part::Parts<EvRec>, Ovf)>, LinkTab) = std::thread::scope(|s| {
         let uf = s.spawn(|| { let t = std::time::Instant::now(); let r = build_links(&edges, &pool); if verbose { eprintln!("uf {:.1} ms", t.elapsed().as_secs_f64()*1e3); } r });
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
-                    let mut b: Vec<Vec<EvRec>> = (0..nb).map(|_| Vec::with_capacity(per)).collect();
+                    let mut b = part::Parts::<EvRec>::new(nb, per);
                     let mut o = Ovf::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -1076,6 +1150,7 @@ fn main() {
                         }
                         parse_events(ev_chunks[i], &ctx, shift, &mut b, &mut o);
                     }
+                    b.finish();
                     (b, o)
                 })
             })
@@ -1087,7 +1162,7 @@ fn main() {
     for (_, o) in &ev_parts {
         pool.extend(o.iter().copied());
     }
-    let ev: Vec<Vec<Vec<EvRec>>> = ev_parts.into_iter().map(|(b, _)| b).collect();
+    let ev: Vec<part::Parts<EvRec>> = ev_parts.into_iter().map(|(b, _)| b).collect();
 
     // D: clicks to person buckets, dedup event buckets to person buckets
     let next = AtomicUsize::new(0);

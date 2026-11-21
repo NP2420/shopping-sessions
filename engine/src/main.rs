@@ -6,6 +6,7 @@
 //!   D  dedup each event-id bucket and scatter winners by person; parse clicks by person
 //!   P  per person bucket: group, sort, sessionize, attribute, aggregate, write Parquet
 
+mod arena;
 mod ids;
 mod pq;
 mod scan;
@@ -15,6 +16,9 @@ use ids::{Pool, EMPTY, OVF};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[global_allocator]
+static ALLOC: arena::Arena = arena::Arena;
 
 const DAY: i64 = ts::DAY_MS;
 const GAP: i64 = 1_800_000;

@@ -963,6 +963,7 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
 
+    ts::init();
     let ctx = build_ctx(&data);
     let ev_files: Vec<&'static [u8]> = csv_files(&data.join("events")).iter().map(|p| map_file(p)).collect();
     let cl_files: Vec<&'static [u8]> = csv_files(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
@@ -1050,16 +1051,21 @@ fn main() {
                     let mut table = Vec::new();
                     let mut win = Vec::new();
                     let mut tmp = Vec::new();
+                    let (mut tc, mut td) = (0f64, 0f64);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= ntasks {
+                            if verbose { eprintln!("  clicks {:.0} ms, dedup {:.0} ms", tc * 1e3, td * 1e3); }
                             break;
                         }
+                        let tt = std::time::Instant::now();
+                        let is_click = i < cl_chunks.len();
                         if i < cl_chunks.len() {
                             parse_clicks(cl_chunks[i], &ctx, &links, shift, &mut pc, &mut o, &mut tmp);
                         } else {
                             dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut win, &mut pe);
                         }
+                        if is_click { tc += tt.elapsed().as_secs_f64(); } else { td += tt.elapsed().as_secs_f64(); }
                     }
                     (pe, pc, o)
                 })

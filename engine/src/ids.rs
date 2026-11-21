@@ -46,7 +46,7 @@ pub static CODE: [u8; 256] = build_code();
 pub static DECODE: [u8; 64] = build_decode();
 
 #[inline(always)]
-pub fn pack(s: &[u8]) -> Option<u64> {
+pub fn pack_slow(s: &[u8]) -> Option<u64> {
     if s.is_empty() || s.len() > 10 {
         return None;
     }
@@ -61,6 +61,60 @@ pub fn pack(s: &[u8]) -> Option<u64> {
         sh = sh.wrapping_sub(6);
     }
     Some(k)
+}
+
+
+/// Same as `pack_slow`, 16 bytes at a time. The 16-byte load never crosses a page boundary
+/// (it falls back otherwise), so it cannot fault even at the end of a mapping.
+#[inline(always)]
+pub fn pack(s: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let n = s.len();
+        let p = s.as_ptr();
+        if n == 0 || n > 10 {
+            return None;
+        }
+        if (p as usize & 4095) > 4096 - 16 {
+            return pack_slow(s);
+        }
+        let v = _mm_loadu_si128(p as *const __m128i);
+        let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let inb = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+        let in_range = |lo: u8, len: u8| -> (__m128i, __m128i) {
+            let x = _mm_sub_epi8(v, _mm_set1_epi8(lo as i8));
+            let ok = _mm_cmpeq_epi8(_mm_min_epu8(x, _mm_set1_epi8((len - 1) as i8)), x);
+            (x, ok)
+        };
+        let (dx, dok) = in_range(b'0', 10);
+        let (ux, uok) = in_range(b'A', 26);
+        let (lx, lok) = in_range(b'a', 26);
+        let sok = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+        let ok = _mm_or_si128(_mm_or_si128(dok, uok), _mm_or_si128(lok, sok));
+        if _mm_movemask_epi8(_mm_or_si128(ok, _mm_xor_si128(inb, _mm_set1_epi8(-1)))) != 0xFFFF {
+            return None;
+        }
+        let code = _mm_or_si128(
+            _mm_or_si128(
+                _mm_and_si128(dok, _mm_add_epi8(dx, _mm_set1_epi8(1))),
+                _mm_and_si128(uok, _mm_add_epi8(ux, _mm_set1_epi8(11))),
+            ),
+            _mm_or_si128(
+                _mm_and_si128(lok, _mm_add_epi8(lx, _mm_set1_epi8(38))),
+                _mm_and_si128(sok, _mm_set1_epi8(37)),
+            ),
+        );
+        let code = _mm_and_si128(code, inb);
+        let pairs = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140)); // c0*64 + c1 per 16-bit lane
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000)); // (c0c1)*4096 + c2c3
+        let l0 = _mm_cvtsi128_si32(quads) as u32 as u64;
+        let l1 = _mm_extract_epi32(quads, 1) as u32 as u64;
+        let l2 = _mm_extract_epi32(quads, 2) as u32 as u64;
+        return Some((l0 << 36) | (l1 << 12) | (l2 >> 12));
+    }
+    #[allow(unreachable_code)]
+    pack_slow(s)
 }
 
 #[inline]
@@ -160,5 +214,28 @@ mod tests {
         assert_eq!(v, b"u1aZ_9");
         assert!(pack(b" u1").is_none());
         assert!(pack(b"abcdefghijk").is_none());
+    }
+
+    #[test]
+    fn simd_matches_slow() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789AZaz_ u\x22-~@[`{/:\x00\xff";
+        let mut buf = vec![0u8; 8192];
+        for _ in 0..3_000_000 {
+            let n = (rnd() % 13) as usize;
+            let off = (rnd() % 8100) as usize;
+            for i in 0..n {
+                let r = rnd();
+                buf[off + i] = if r % 4 == 0 { alpha[(r as usize >> 3) % alpha.len()] } else { b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"[(r as usize >> 8) % 63] };
+            }
+            let sl = &buf[off..off + n];
+            assert_eq!(pack(sl), pack_slow(sl), "{:?}", sl);
+        }
     }
 }

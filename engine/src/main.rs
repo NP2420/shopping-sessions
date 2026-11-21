@@ -8,6 +8,7 @@
 
 mod ids;
 mod pq;
+mod scan;
 mod ts;
 
 use ids::{Pool, EMPTY, OVF};
@@ -336,9 +337,8 @@ fn parse_price(p: &[u8]) -> Option<u32> {
 fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut [Vec<EvRec>], ovf: &mut Ovf) {
     let ws = ctx.ws;
     let we = ctx.we;
-    for_lines(c, |line| {
-        let mut f = [&[][..]; 7];
-        if !split::<7>(line, &mut f) || f[0].is_empty() {
+    scan::lines::<7>(c.data, c.start, c.end, |f| {
+        if f[0].is_empty() {
             return;
         }
         let eid = ids::ident(f[0]);
@@ -373,9 +373,8 @@ fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut [Vec<EvRec>], ovf: &m
 }
 
 fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
-    for_lines(c, |line| {
-        let mut f = [&[][..]; 2];
-        if !split::<2>(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+    scan::lines::<2>(c.data, c.start, c.end, |f| {
+        if f[0].is_empty() || f[1].is_empty() {
             return;
         }
         let a = ids::key(f[0], ovf);
@@ -384,12 +383,12 @@ fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
     });
 }
 
-fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut [Vec<CRec>], ovf: &mut Ovf) {
+fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut [Vec<CRec>], ovf: &mut Ovf, tmp: &mut Vec<CRec>) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
-    for_lines(c, |line| {
-        let mut f = [&[][..]; 4];
-        if !split::<4>(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+    tmp.clear();
+    scan::lines::<4>(c.data, c.start, c.end, |f| {
+        if f[0].is_empty() || f[1].is_empty() {
             return;
         }
         let camp = match ctx.camp_of(f[2]) {
@@ -402,16 +401,23 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut [Vec
         };
         let ck = ids::key(f[0], ovf);
         let uk = ids::key(f[1], ovf);
-        let pk = links.get(uk);
-        out[bucket(pk, shift)].push(CRec { pk, ck, ts: (t - lo) as u32, camp });
+        tmp.push(CRec { pk: uk, ck, ts: (t - lo) as u32, camp });
     });
+    const D: usize = 16;
+    for i in 0..tmp.len() {
+        if i + D < tmp.len() {
+            links.prefetch(tmp[i + D].pk);
+        }
+        let mut r = tmp[i];
+        r.pk = links.get(r.pk);
+        out[bucket(r.pk, shift)].push(r);
+    }
 }
 
 // ---------------------------------------------------------------- linked IDs
 
 struct LinkTab {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    slots: Vec<[u64; 2]>,
     mask: usize,
 }
 
@@ -420,15 +426,28 @@ impl LinkTab {
     fn get(&self, k: u64) -> u64 {
         let mut i = ids::mix(k) as usize & self.mask;
         loop {
-            let kk = unsafe { *self.keys.get_unchecked(i) };
-            if kk == k {
-                return unsafe { *self.vals.get_unchecked(i) };
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s[0] == k {
+                return s[1];
             }
-            if kk == EMPTY {
+            if s[0] == EMPTY {
                 return k;
             }
             i = (i + 1) & self.mask;
         }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let i = ids::mix(k) as usize & self.mask;
+        prefetch(unsafe { self.slots.as_ptr().add(i) } as *const u8);
+    }
+}
+
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
     }
 }
 
@@ -494,7 +513,7 @@ fn build_links(edges: &[Vec<(u64, u64)>], pool: &Pool) -> LinkTab {
     }
     let n = keys.len();
     let cap = (n * 2).next_power_of_two().max(2);
-    let mut t = LinkTab { keys: vec![EMPTY; cap], vals: vec![0; cap], mask: cap - 1 };
+    let mut t = LinkTab { slots: vec![[EMPTY, 0]; cap], mask: cap - 1 };
     for i in 0..n {
         let r = find(&mut parent, i as u32);
         let name = keys[r as usize];
@@ -503,11 +522,10 @@ fn build_links(edges: &[Vec<(u64, u64)>], pool: &Pool) -> LinkTab {
             continue;
         }
         let mut j = ids::mix(k) as usize & t.mask;
-        while t.keys[j] != EMPTY {
+        while t.slots[j][0] != EMPTY {
             j = (j + 1) & t.mask;
         }
-        t.keys[j] = k;
-        t.vals[j] = name;
+        t.slots[j] = [k, name];
     }
     t
 }
@@ -520,13 +538,14 @@ fn dedup_bucket(
     links: &LinkTab,
     shift: u32,
     table: &mut Vec<(u64, *const EvRec)>,
+    win: &mut Vec<PRec>,
     out: &mut [Vec<PRec>],
 ) {
     let n: usize = ev.iter().map(|t| t[b].len()).sum();
     if n == 0 {
         return;
     }
-    let cap = (n * 2).next_power_of_two();
+    let cap = (n + n / 2).next_power_of_two();
     let mask = cap - 1;
     table.clear();
     table.resize(cap, (EMPTY, std::ptr::null()));
@@ -549,6 +568,7 @@ fn dedup_bucket(
             }
         }
     }
+    win.clear();
     for s in table.iter() {
         if s.0 == EMPTY {
             continue;
@@ -557,8 +577,16 @@ fn dedup_bucket(
         if r.ts == u32::MAX {
             continue;
         }
-        let pk = links.get(r.user);
-        out[bucket(pk, shift)].push(PRec { pk, ts: r.ts, pc: r.pc });
+        win.push(PRec { pk: r.user, ts: r.ts, pc: r.pc });
+    }
+    const D: usize = 16;
+    for i in 0..win.len() {
+        if i + D < win.len() {
+            links.prefetch(win[i + D].pk);
+        }
+        let mut r = win[i];
+        r.pk = links.get(r.pk);
+        out[bucket(r.pk, shift)].push(r);
     }
 }
 
@@ -1009,15 +1037,17 @@ fn main() {
                     let mut pc: Vec<Vec<CRec>> = (0..nb).map(|_| Vec::new()).collect();
                     let mut o = Ovf::new();
                     let mut table = Vec::new();
+                    let mut win = Vec::new();
+                    let mut tmp = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= ntasks {
                             break;
                         }
                         if i < cl_chunks.len() {
-                            parse_clicks(cl_chunks[i], &ctx, &links, shift, &mut pc, &mut o);
+                            parse_clicks(cl_chunks[i], &ctx, &links, shift, &mut pc, &mut o, &mut tmp);
                         } else {
-                            dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut pe);
+                            dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut win, &mut pe);
                         }
                     }
                     (pe, pc, o)

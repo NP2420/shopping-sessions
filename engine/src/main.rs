@@ -451,83 +451,94 @@ fn prefetch(p: *const u8) {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-struct FxBuild;
-#[derive(Default)]
-struct Fx(u64);
-impl std::hash::Hasher for Fx {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+/// Union-find directly in an open-addressing table: a node is its slot. The root of a set is
+/// always its smallest ID, so at the end every slot's value becomes its person's name, and the
+/// same table serves `get` (an ID not in the table is a person on its own).
+fn build_links(edges: &[Vec<(u64, u64)>], pool: &Pool) -> LinkTab {
+    let ne: usize = edges.iter().map(|e| e.len()).sum();
+    let mut cap = (ne * 2).next_power_of_two().max(16);
+    loop {
+        if let Some(t) = try_links(edges, pool, cap) {
+            return t;
         }
-    }
-    fn write_u64(&mut self, v: u64) {
-        self.0 = ids::mix(v);
-    }
-}
-impl std::hash::BuildHasher for FxBuild {
-    type Hasher = Fx;
-    fn build_hasher(&self) -> Fx {
-        Fx(0)
+        cap *= 2;
     }
 }
 
-fn build_links(edges: &[Vec<(u64, u64)>], pool: &Pool) -> LinkTab {
-    let ne: usize = edges.iter().map(|e| e.len()).sum();
-    let mut idx: HashMap<u64, u32, FxBuild> = HashMap::with_capacity_and_hasher(ne * 2 + 16, FxBuild);
-    let mut keys: Vec<u64> = Vec::with_capacity(ne * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(ne * 2);
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        while p[x as usize] != x {
-            let g = p[p[x as usize] as usize];
-            p[x as usize] = g;
+fn try_links(edges: &[Vec<(u64, u64)>], pool: &Pool, cap: usize) -> Option<LinkTab> {
+    let mask = cap - 1;
+    let limit = cap / 10 * 9;
+    // slot = [key, parent slot]; parent slot index stored in the value word during the build
+    let mut sl: Vec<[u64; 2]> = vec![[EMPTY, 0]; cap];
+    let mut used = 0usize;
+    #[inline(always)]
+    fn insert(sl: &mut [[u64; 2]], mask: usize, k: u64, used: &mut usize) -> usize {
+        let mut i = ids::mix(k) as usize & mask;
+        loop {
+            let s = unsafe { sl.get_unchecked_mut(i) };
+            if s[0] == k {
+                return i;
+            }
+            if s[0] == EMPTY {
+                *s = [k, i as u64];
+                *used += 1;
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    #[inline(always)]
+    fn find(sl: &mut [[u64; 2]], mut x: usize) -> usize {
+        loop {
+            let p = sl[x][1] as usize;
+            if p == x {
+                return x;
+            }
+            let g = sl[p][1] as usize;
+            sl[x][1] = g as u64;
             x = g;
         }
-        x
     }
-    let mut intern = |k: u64, keys: &mut Vec<u64>, parent: &mut Vec<u32>| -> u32 {
-        *idx.entry(k).or_insert_with(|| {
-            keys.push(k);
-            parent.push(parent.len() as u32);
-            (keys.len() - 1) as u32
-        })
-    };
+    const D: usize = 8;
     for es in edges {
-        for &(a, b) in es {
-            let ia = intern(a, &mut keys, &mut parent);
-            let ib = intern(b, &mut keys, &mut parent);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
+        for (j, &(a, b)) in es.iter().enumerate() {
+            if j + D < es.len() {
+                let (pa, pb) = es[j + D];
+                prefetch(unsafe { sl.as_ptr().add(ids::mix(pa) as usize & mask) } as *const u8);
+                prefetch(unsafe { sl.as_ptr().add(ids::mix(pb) as usize & mask) } as *const u8);
+            }
+            let ia = insert(&mut sl, mask, a, &mut used);
+            let ib = insert(&mut sl, mask, b, &mut used);
+            if used > limit {
+                return None;
+            }
+            let ra = find(&mut sl, ia);
+            let rb = find(&mut sl, ib);
             if ra != rb {
-                // root = the smaller ID, so the root's key is the person's name
-                if ids::cmp_keys(keys[rb as usize], keys[ra as usize], pool).is_lt() {
-                    parent[ra as usize] = rb;
+                let (ka, kb) = (sl[ra][0], sl[rb][0]);
+                let a_smaller = if (ka | kb) & OVF == 0 { ka < kb } else { ids::cmp_keys(ka, kb, pool).is_lt() };
+                if a_smaller {
+                    sl[rb][1] = ra as u64;
                 } else {
-                    parent[rb as usize] = ra;
+                    sl[ra][1] = rb as u64;
                 }
             }
         }
     }
-    let n = keys.len();
-    let cap = (n * 2).next_power_of_two().max(2);
-    let mut t = LinkTab { slots: vec![[EMPTY, 0]; cap], mask: cap - 1 };
-    for i in 0..n {
-        let r = find(&mut parent, i as u32);
-        let name = keys[r as usize];
-        let k = keys[i];
-        if name == k {
-            continue;
+    // resolve every slot to its root, then replace parent indices with names
+    for i in 0..cap {
+        if sl[i][0] != EMPTY {
+            let r = find(&mut sl, i);
+            sl[i][1] = r as u64;
         }
-        let mut j = ids::mix(k) as usize & t.mask;
-        while t.slots[j][0] != EMPTY {
-            j = (j + 1) & t.mask;
-        }
-        t.slots[j] = [k, name];
     }
-    t
+    for i in 0..cap {
+        if sl[i][0] != EMPTY {
+            let r = sl[i][1] as usize;
+            sl[i][1] = sl[r][0];
+        }
+    }
+    Some(LinkTab { slots: sl, mask })
 }
 
 // ---------------------------------------------------------------- dedup
@@ -963,7 +974,7 @@ fn main() {
     let cl_chunks = chunks_of(&cl_files, csize);
     let ln_chunks = chunks_of(&ln_files, csize);
     let est_events = ev_bytes / 80 + 1;
-    let nb = (est_events / 12_000).next_power_of_two().clamp(64, 4096);
+    let nb = (est_events / 40_000).next_power_of_two().clamp(64, 2048);
     let shift = 64 - nb.trailing_zeros();
     let per = est_events / nt / nb * 5 / 4 + 32;
     lap("setup");
@@ -999,7 +1010,7 @@ fn main() {
     // E: events, with union-find on its own thread
     let next = AtomicUsize::new(0);
     let (ev_parts, links): (Vec<(Vec<Vec<EvRec>>, Ovf)>, LinkTab) = std::thread::scope(|s| {
-        let uf = s.spawn(|| build_links(&edges, &pool));
+        let uf = s.spawn(|| { let t = std::time::Instant::now(); let r = build_links(&edges, &pool); if verbose { eprintln!("uf {:.1} ms", t.elapsed().as_secs_f64()*1e3); } r });
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {

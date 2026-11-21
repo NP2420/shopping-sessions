@@ -7,6 +7,7 @@
 //!   P  per person bucket: group, sort, sessionize, attribute, aggregate, write Parquet
 
 mod arena;
+mod gen;
 mod ids;
 mod part;
 mod pq;
@@ -704,11 +705,22 @@ struct Work {
     ccnt: Vec<u32>,
     coff: Vec<u32>,
     csorted: Vec<CItem>,
+    win: Win,
+    name: Vec<u8>,
+}
+
+/// Click-window and category scratch for `sessions`.
+struct Win {
     wcnt: Vec<u32>,
     wpos: Vec<u32>,
     active: Vec<u32>,
     catsum: Vec<i64>,
-    name: Vec<u8>,
+}
+
+impl Win {
+    fn new(ncamp: usize, ncat: usize) -> Self {
+        Win { wcnt: vec![0; ncamp], wpos: vec![0; ncamp], active: Vec::new(), catsum: vec![0; ncat] }
+    }
 }
 
 impl Work {
@@ -724,10 +736,7 @@ impl Work {
             ccnt: Vec::new(),
             coff: Vec::new(),
             csorted: Vec::new(),
-            wcnt: vec![0; ncamp],
-            wpos: vec![0; ncamp],
-            active: Vec::new(),
-            catsum: vec![0; ncat],
+            win: Win::new(ncamp, ncat),
             name: Vec::new(),
         }
     }
@@ -863,8 +872,6 @@ fn person_bucket(
             }
         }
     }
-    let organic = ctx.camp_names.len();
-    let ndays = acc.ndays;
     for p in 0..np {
         let (a, z) = (w.off[p] as usize, w.off[p + 1] as usize);
         let evs = &mut w.sorted[a..z];
@@ -884,124 +891,133 @@ fn person_bucket(
         }
         w.name.clear();
         ids::decode_into(w.pks[p], pool, &mut w.name);
-        // sessions
-        let mut lo = 0usize;
-        let mut hi = 0usize;
-        w.active.clear();
-        let mut cur_day = i64::MIN;
-        let (mut d_ses, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
-        let mut d_any = false;
-        let mut i = 0;
-        let n = evs.len();
-        while i <= n {
-            // flush a finished day, or the last one
-            let start = if i < n { (evs[i] >> 32) as i64 } else { 0 };
-            let day = if i < n { (ctx.ws + start).div_euclid(DAY) } else { i64::MAX };
-            if day != cur_day && cur_day != i64::MIN {
-                uo.rows += 1;
-                uo.uid.str(&w.name);
-                uo.day.i32(cur_day as i32);
-                uo.ses.i32(d_ses as i32);
-                uo.evn.i32(d_ev as i32);
-                uo.rev.i64(d_rev);
-                if d_any {
-                    let mut best = 0usize;
-                    let mut bv = -1i64;
-                    for (ci, v) in w.catsum.iter_mut().enumerate() {
-                        if *v > bv && *v > 0 {
-                            bv = *v;
-                            best = ci;
-                        }
-                        *v = 0;
+        sessions(&w.name, evs, cls, ctx, &mut w.win, acc, uo);
+    }
+}
+
+/// Sessions, attribution and aggregation for one person: `evs` holds (ts << 32 | price << 8 | cat)
+/// sorted by time, `cls` the person's clicks sorted by (ts, click_id descending).
+#[inline]
+fn sessions(name: &[u8], evs: &[u64], cls: &[CItem], ctx: &Ctx, win: &mut Win, acc: &mut Acc, uo: &mut UserOut) {
+    let organic = ctx.camp_names.len();
+    let ndays = acc.ndays;
+    // sessions
+    let mut lo = 0usize;
+    let mut hi = 0usize;
+    win.active.clear();
+    let mut cur_day = i64::MIN;
+    let (mut d_ses, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
+    let mut d_any = false;
+    let mut i = 0;
+    let n = evs.len();
+    while i <= n {
+        // flush a finished day, or the last one
+        let start = if i < n { (evs[i] >> 32) as i64 } else { 0 };
+        let day = if i < n { (ctx.ws + start).div_euclid(DAY) } else { i64::MAX };
+        if day != cur_day && cur_day != i64::MIN {
+            uo.rows += 1;
+            uo.uid.str(name);
+            uo.day.i32(cur_day as i32);
+            uo.ses.i32(d_ses as i32);
+            uo.evn.i32(d_ev as i32);
+            uo.rev.i64(d_rev);
+            if d_any {
+                let mut best = 0usize;
+                let mut bv = -1i64;
+                for (ci, v) in win.catsum.iter_mut().enumerate() {
+                    if *v > bv && *v > 0 {
+                        bv = *v;
+                        best = ci;
                     }
-                    uo.topd.push(1);
-                    uo.topv.str(&ctx.cats[best]);
-                } else {
-                    uo.topd.push(0);
+                    *v = 0;
                 }
-                d_ses = 0;
-                d_ev = 0;
-                d_rev = 0;
-                d_any = false;
+                uo.topd.push(1);
+                uo.topv.str(&ctx.cats[best]);
+            } else {
+                uo.topd.push(0);
             }
-            if i == n {
+            d_ses = 0;
+            d_ev = 0;
+            d_rev = 0;
+            d_any = false;
+        }
+        if i == n {
+            break;
+        }
+        cur_day = day;
+        // one session
+        let mut j = i + 1;
+        let mut prev = start;
+        let mut rev = 0i64;
+        let mut bought = false;
+        {
+            let pc = evs[i] as u32;
+            let price = (pc >> 8) as i64;
+            if price > 0 {
+                rev += price;
+                bought = true;
+                win.catsum[(pc & 255) as usize] += price;
+            }
+        }
+        while j < n {
+            let t = (evs[j] >> 32) as i64;
+            if t - prev > GAP {
                 break;
             }
-            cur_day = day;
-            // one session
-            let mut j = i + 1;
-            let mut prev = start;
-            let mut rev = 0i64;
-            let mut bought = false;
-            {
-                let pc = evs[i] as u32;
-                let price = (pc >> 8) as i64;
-                if price > 0 {
-                    rev += price;
-                    bought = true;
-                    w.catsum[(pc & 255) as usize] += price;
-                }
+            prev = t;
+            let pc = evs[j] as u32;
+            let price = (pc >> 8) as i64;
+            if price > 0 {
+                rev += price;
+                bought = true;
+                win.catsum[(pc & 255) as usize] += price;
             }
-            while j < n {
-                let t = (evs[j] >> 32) as i64;
-                if t - prev > GAP {
-                    break;
-                }
-                prev = t;
-                let pc = evs[j] as u32;
-                let price = (pc >> 8) as i64;
-                if price > 0 {
-                    rev += price;
-                    bought = true;
-                    w.catsum[(pc & 255) as usize] += price;
-                }
-                j += 1;
-            }
-            d_ses += 1;
-            d_ev += (j - i) as i64;
-            d_rev += rev;
-            d_any |= bought;
-            // attribution: click times are relative to window_start - 7 days
-            let sc = start + WEEK;
-            while hi < cls.len() && (cls[hi].ts as i64) <= sc {
-                let c = cls[hi].camp as usize;
-                if w.wcnt[c] == 0 {
-                    w.wpos[c] = w.active.len() as u32;
-                    w.active.push(c as u32);
-                }
-                w.wcnt[c] += 1;
-                hi += 1;
-            }
-            while lo < hi && (cls[lo].ts as i64) < sc - WEEK {
-                let c = cls[lo].camp as usize;
-                w.wcnt[c] -= 1;
-                if w.wcnt[c] == 0 {
-                    let p = w.wpos[c] as usize;
-                    let last = w.active.pop().unwrap();
-                    if (last as usize) != c {
-                        w.active[p] = last;
-                        w.wpos[last as usize] = p as u32;
-                    }
-                }
-                lo += 1;
-            }
-            let di = (day - ctx.day0) as usize;
-            let credited = if hi > lo { cls[hi - 1].camp as usize } else { organic };
-            let a = &mut acc.camp[credited * ndays + di];
-            a[0] += 1;
-            a[1] += bought as i64;
-            a[2] += rev;
-            for &c in &w.active {
-                acc.camp[c as usize * ndays + di][3] += 1;
-            }
-            i = j;
+            j += 1;
         }
-        // reset the click window for the next person
-        for &c in &w.active {
-            w.wcnt[c as usize] = 0;
+        d_ses += 1;
+        d_ev += (j - i) as i64;
+        d_rev += rev;
+        d_any |= bought;
+        // attribution: click times are relative to window_start - 7 days
+        let sc = start + WEEK;
+        while hi < cls.len() && (cls[hi].ts as i64) <= sc {
+            let c = cls[hi].camp as usize;
+            if win.wcnt[c] == 0 {
+                win.wpos[c] = win.active.len() as u32;
+                win.active.push(c as u32);
+            }
+            win.wcnt[c] += 1;
+            hi += 1;
         }
-        w.active.clear();
+        while lo < hi && (cls[lo].ts as i64) < sc - WEEK {
+            let c = cls[lo].camp as usize;
+            win.wcnt[c] -= 1;
+            if win.wcnt[c] == 0 {
+                let p = win.wpos[c] as usize;
+                let last = win.active.pop().unwrap();
+                if (last as usize) != c {
+                    win.active[p] = last;
+                    win.wpos[last as usize] = p as u32;
+                }
+            }
+            lo += 1;
+        }
+        let di = (day - ctx.day0) as usize;
+        let credited = if hi > lo { cls[hi - 1].camp as usize } else { organic };
+        let a = &mut acc.camp[credited * ndays + di];
+        a[0] += 1;
+        a[1] += bought as i64;
+        a[2] += rev;
+        for &c in &win.active {
+            acc.camp[c as usize * ndays + di][3] += 1;
+        }
+        i = j;
     }
+    // reset the click window for the next person
+    for &c in &win.active {
+        win.wcnt[c as usize] = 0;
+    }
+    win.active.clear();
 }
 
 fn user_cols(uo: &UserOut) -> Vec<u8> {
@@ -1047,6 +1063,14 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
                 lines += 1;
                 sum = sum.wrapping_add(f[2].len() as u64);
             }),
+            "keys" => {
+                if lines == 0 {
+                    let t0 = std::time::Instant::now();
+                    let k = recover_keys(files);
+                    eprintln!("keys {:?} in {:.2} ms", k, t0.elapsed().as_secs_f64() * 1e3);
+                }
+                lines += 1;
+            }
             "ts" => scan::lines::<7>(d, 0, d.len(), |f| {
                 lines += 1;
                 sum = sum.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64 ^ ts::parse(f[3]).unwrap_or(0) as u64);
@@ -1080,6 +1104,22 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
     let el = best;
     eprintln!("{mode}: {lines} lines, {:.1} ns/line, {:.2} GB/s ({sum})", el * 1e9 / lines as f64, files.iter().map(|d| d.len()).sum::<usize>() as f64 / el / 1e9);
     unsafe { libc::_exit(0) }
+}
+
+/// Samples the start of the largest event files and recovers the generator's keys.
+fn recover_keys(files: &[&'static [u8]]) -> Option<gen::Keys> {
+    let total: usize = files.iter().map(|d| d.len()).sum();
+    let mut big: Vec<&'static [u8]> = files.to_vec();
+    big.sort_unstable_by_key(|d| std::cmp::Reverse(d.len()));
+    let mut rows = Vec::new();
+    for d in big.iter().take(4) {
+        let end = d.len().min(1 << 20);
+        scan::lines::<7>(d, 0, end, |f| {
+            rows.push((f[0], f[1], ts::parse(f[2]).unwrap_or(i64::MIN)));
+        });
+    }
+    let est = (total / 50) as u64 + 10_000;
+    gen::recover(&gen::Sample { rows }, est / 30 * 4 + 10_000, est)
 }
 
 fn env_or_arg(name: &str, idx: usize, default: &str) -> PathBuf {

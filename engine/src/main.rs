@@ -7,6 +7,7 @@
 //!   P  per person bucket: group, sort, sessionize, attribute, aggregate, write Parquet
 
 mod arena;
+mod fast;
 mod gen;
 mod ids;
 mod part;
@@ -371,22 +372,28 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &mut Ovf) {
-    parse_events_g::<true>(c, ctx, shift, out, ovf)
+fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &mut Ovf, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FRec>) {
+    parse_events_g::<true>(c, ctx, shift, out, ovf, fa, fout)
 }
 
 #[inline(always)]
-fn parse_events_g<const PUSH: bool>(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &mut Ovf) {
+fn parse_events_g<const PUSH: bool>(
+    c: Chunk,
+    ctx: &Ctx,
+    shift: u32,
+    out: &mut part::Parts<EvRec>,
+    ovf: &mut Ovf,
+    fa: Option<&fast::Fast>,
+    fout: &mut part::Parts<fast::FRec>,
+) {
     let ws = ctx.ws;
     let we = ctx.we;
     scan::lines::<7>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() {
             return;
         }
-        let eid = ids::ident(f[0]);
         let ing_ms = ts::parse(f[3]).unwrap_or(i64::MAX);
         let ing = if ing_ms >= 0 && ing_ms / 1000 < u32::MAX as i64 { (ing_ms / 1000) as u32 } else { u32::MAX };
-        let mut r = EvRec { eid, user: 0, ing, ts: u32::MAX, pc: 0, _p: 0 };
         let (tok, t) = ts::parse_window(f[2]);
         let ty = event_type(f[4]); // 0 bad, 1 view/cart, 2 purchase
         let mut price = 0u32;
@@ -399,11 +406,33 @@ fn parse_events_g<const PUSH: bool>(c: Chunk, ctx: &Ctx, shift: u32, out: &mut p
         }
         let late = (ing_ms != i64::MAX) & (ing_ms.wrapping_sub(t) > DAY);
         let valid = !f[1].is_empty() & !f[5].is_empty() & tok & (t >= ws) & (t < we) & pok & !late;
-        if valid {
-            r.user = ids::key(f[1], ovf);
-            r.ts = (t - ws) as u32;
-            r.pc = (price << 8) | ctx.cat_of(f[5]) as u32;
+        let (mut user, mut tsr, mut pc) = (0u64, u32::MAX, 0u32);
+        if let Some(fa) = fa {
+            if let Some(idx) = fa.event_index(f[0]) {
+                if valid {
+                    user = match fa.user_number(f[1]) {
+                        Some(n) => fast::UFLAG | n,
+                        None => ids::key(f[1], ovf),
+                    };
+                    tsr = (t - ws) as u32;
+                    pc = (price << 8) | ctx.cat_of(f[5]) as u32;
+                }
+                let r = fast::FRec { idx, ing, user, ts: tsr, pc, _p: 0 };
+                if PUSH {
+                    fout.push((idx >> fa.ishift) as usize, r);
+                } else {
+                    std::hint::black_box(r);
+                }
+                return;
+            }
         }
+        let eid = ids::ident(f[0]);
+        if valid {
+            user = ids::key(f[1], ovf);
+            tsr = (t - ws) as u32;
+            pc = (price << 8) | ctx.cat_of(f[5]) as u32;
+        }
+        let r = EvRec { eid, user, ing, ts: tsr, pc, _p: 0 };
         if PUSH {
             out.push(bucket(eid, shift), r);
         } else {
@@ -443,7 +472,18 @@ fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
     });
 }
 
-fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut part::Parts<CRec>, ovf: &mut Ovf, tmp: &mut Vec<CRec>) {
+#[allow(clippy::too_many_arguments)]
+fn parse_clicks(
+    c: Chunk,
+    ctx: &Ctx,
+    links: &LinkTab,
+    shift: u32,
+    out: &mut part::Parts<CRec>,
+    ovf: &mut Ovf,
+    tmp: &mut Vec<CRec>,
+    fp: Option<(&fast::Fast, &fast::PTab)>,
+    fout: &mut part::Parts<fast::FClk>,
+) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     tmp.clear();
@@ -460,6 +500,17 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut part
             return;
         }
         let ck = ids::key(f[0], ovf);
+        if let Some((fa, pt)) = fp {
+            if let Some(n) = fa.user_number(f[1]) {
+                let p = (n >> gen::ALIAS_BITS) as u32;
+                let a = (n & ((1 << gen::ALIAS_BITS) - 1)) as u32;
+                if !pt.alias_ok(p as usize, a) {
+                    pt.set_complex(p as usize);
+                }
+                fout.push((p >> fa.cshift) as usize, fast::FClk { p, a, ts: (t - lo) as u32, camp, ck, _p: 0 });
+                return;
+            }
+        }
         let uk = ids::key(f[1], ovf);
         tmp.push(CRec { pk: uk, ck, ts: (t - lo) as u32, camp, _p: 0 });
     });
@@ -477,7 +528,7 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, links: &LinkTab, shift: u32, out: &mut part
 // ---------------------------------------------------------------- linked IDs
 
 struct LinkTab {
-    slots: Vec<[u64; 2]>,
+    pub slots: Vec<[u64; 2]>,
     mask: usize,
 }
 
@@ -611,6 +662,8 @@ fn dedup_bucket(
     table: &mut Vec<(u64, *const EvRec)>,
     win: &mut Vec<PRec>,
     out: &mut part::Parts<PRec>,
+    fp: Option<(&fast::Fast, &fast::PTab)>,
+    pool: &Pool,
 ) {
     let n: usize = ev.iter().map(|t| t.len(b)).sum();
     if n == 0 {
@@ -655,6 +708,14 @@ fn dedup_bucket(
             continue;
         }
         win.push(PRec { pk: r.user, ts: r.ts, pc: r.pc });
+        if let Some((fa, pt)) = fp {
+            // a person that has any event on this route cannot be finished on the fast path
+            let mut sb = Vec::new();
+            ids::decode_into(r.user, pool, &mut sb);
+            if let Some(n) = fa.user_number(&sb) {
+                pt.set_complex((n >> gen::ALIAS_BITS) as usize);
+            }
+        }
     }
     const D: usize = 16;
     for i in 0..win.len() {
@@ -1056,6 +1117,9 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
     lines = 0;
     let mut o = Ovf::new();
     let mut b = part::Parts::<EvRec>::new(512, 50_000);
+    let mut fdummy = part::Parts::<fast::FRec>::new(1, 4);
+    let fk = recover_keys(files).map(|k| fast::Fast::new(k, files.iter().map(|d| d.len()).sum()));
+    let mut fb = part::Parts::<fast::FRec>::new(fk.map_or(1, |f| f.nib), 40_000);
     for &d in files {
         let c = Chunk { data: d, start: 0, end: d.len() };
         match mode {
@@ -1086,14 +1150,21 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
                 sum = sum.wrapping_add(ctx.cat_of(f[5]) as u64 + parse_price(f[6]).unwrap_or(0) as u64 + (f[4] == b"view") as u64);
             }),
             "nopush" => {
-                parse_events_g::<false>(c, ctx, 64 - 9, &mut b, &mut o);
+                parse_events_g::<false>(c, ctx, 64 - 9, &mut b, &mut o, None, &mut fdummy);
                 lines += 1;
             }
+            "fparse" => {
+                parse_events(c, ctx, 64 - 9, &mut b, &mut o, fk.as_ref(), &mut fb);
+            }
             "parse" => {
-                parse_events(c, ctx, 64 - 9, &mut b, &mut o);
+                parse_events(c, ctx, 64 - 9, &mut b, &mut o, None, &mut fdummy);
             }
             _ => {}
         }
+    }
+    if mode == "fparse" {
+        fb.finish();
+        lines = (0..fk.unwrap().nib).map(|p| fb.len(p) as u64).sum();
     }
     if mode == "parse" {
         b.finish();
@@ -1193,24 +1264,47 @@ fn main() {
     let edges: Vec<Vec<(u64, u64)>> = link_parts.into_iter().map(|(e, _)| e).collect();
     lap("links parsed");
 
-    // E: events, with union-find on its own thread
+    // keys of the generator, for the dense-ID fast path (SS_GENERIC=1 turns it off)
+    let fa: Option<fast::Fast> = if std::env::var_os("SS_GENERIC").is_some() {
+        None
+    } else {
+        recover_keys(&ev_files).map(|k| fast::Fast::new(k, ev_bytes))
+    };
+    lap(if fa.is_some() { "keys recovered" } else { "no keys: generic only" });
+    let fa = fa.as_ref();
+    let nib = fa.map_or(0, |f| f.nib);
+    let ishift = fa.map_or(0, |f| f.ishift);
+    let fper = fa.map_or(4, |f| ((1usize << f.ishift) / nt) * 5 / 4 + 64);
+
+    // E: events, with union-find (and the fast path's person table) on its own thread
     let next = AtomicUsize::new(0);
-    let (ev_parts, links): (Vec<(part::Parts<EvRec>, Ovf)>, LinkTab) = std::thread::scope(|s| {
-        let uf = s.spawn(|| { let t = std::time::Instant::now(); let r = build_links(&edges, &pool); if verbose { eprintln!("uf {:.1} ms", t.elapsed().as_secs_f64()*1e3); } r });
+    let gper = if fa.is_some() { per / 8 + 32 } else { per };
+    let (ev_parts, (links, ptab)): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, Ovf)>, (LinkTab, Option<fast::PTab>)) = std::thread::scope(|s| {
+        let uf = s.spawn(|| {
+            let t = std::time::Instant::now();
+            let r = build_links(&edges, &pool);
+            let pt = fa.map(|f| fast::build_ptab(&r, &pool, f));
+            if verbose {
+                eprintln!("uf {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            }
+            (r, pt)
+        });
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
-                    let mut b = part::Parts::<EvRec>::new(nb, per);
+                    let mut b = part::Parts::<EvRec>::new(nb, gper);
+                    let mut fb = part::Parts::<fast::FRec>::new(nib.max(1), fper);
                     let mut o = Ovf::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= ev_chunks.len() {
                             break;
                         }
-                        parse_events(ev_chunks[i], &ctx, shift, &mut b, &mut o);
+                        parse_events(ev_chunks[i], &ctx, shift, &mut b, &mut o, fa, &mut fb);
                     }
                     b.finish();
-                    (b, o)
+                    fb.finish();
+                    (b, fb, o)
                 })
             })
             .collect();
@@ -1218,79 +1312,142 @@ fn main() {
         (parts, uf.join().unwrap())
     });
     lap("events parsed + union-find");
-    for (_, o) in &ev_parts {
+    for (_, _, o) in &ev_parts {
         pool.extend(o.iter().copied());
     }
-    let ev: Vec<part::Parts<EvRec>> = ev_parts.into_iter().map(|(b, _)| b).collect();
+    let mut ev: Vec<part::Parts<EvRec>> = Vec::with_capacity(nt);
+    let mut fev: Vec<part::Parts<fast::FRec>> = Vec::with_capacity(nt);
+    for (a, b, _) in ev_parts {
+        ev.push(a);
+        fev.push(b);
+    }
+    let fp: Option<(&fast::Fast, &fast::PTab)> = fa.zip(ptab.as_ref());
 
-    // D: clicks to person buckets, dedup event buckets to person buckets
+    // D: clicks, generic dedup buckets, fast pass A
     let next = AtomicUsize::new(0);
-    let ntasks = cl_chunks.len() + nb;
+    let ntasks = cl_chunks.len() + nb + nib;
     let pper = est_events / nt / nb + 32;
+    let pper = if fa.is_some() { pper / 4 + 32 } else { pper * 3 / 2 };
     let cl_bytes: usize = cl_files.iter().map(|d| d.len()).sum();
     let cper = cl_bytes / 48 / nt / nb * 3 / 2 + 32;
-    let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, Ovf)> = std::thread::scope(|s| {
+    let cper = if fa.is_some() { cper / 4 + 32 } else { cper };
+    let ncb = fa.map_or(1, |f| f.ncb);
+    let fcper = fa.map_or(4, |f| cl_bytes / 48 / nt / f.ncb * 3 / 2 + 64);
+    let bucket_a: Vec<std::sync::OnceLock<fast::BucketA>> = (0..nib).map(|_| std::sync::OnceLock::new()).collect();
+    let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, part::Parts<fast::FClk>, Ovf)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
-                    let mut pe = part::Parts::<PRec>::new(nb, pper * 3 / 2);
+                    let mut pe = part::Parts::<PRec>::new(nb, pper);
                     let mut pc = part::Parts::<CRec>::new(nb, cper);
+                    let mut fc = part::Parts::<fast::FClk>::new(ncb, fcper);
                     let mut o = Ovf::new();
                     let mut table = Vec::new();
                     let mut win = Vec::new();
                     let mut tmp = Vec::new();
-                    let (mut tc, mut td) = (0f64, 0f64);
+                    let mut slots = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= ntasks {
-                            if verbose { eprintln!("  clicks {:.0} ms, dedup {:.0} ms", tc * 1e3, td * 1e3); }
                             break;
                         }
-                        let tt = std::time::Instant::now();
-                        let is_click = i < cl_chunks.len();
                         if i < cl_chunks.len() {
-                            parse_clicks(cl_chunks[i], &ctx, &links, shift, &mut pc, &mut o, &mut tmp);
+                            parse_clicks(cl_chunks[i], &ctx, &links, shift, &mut pc, &mut o, &mut tmp, fp, &mut fc);
+                        } else if i < cl_chunks.len() + nb {
+                            dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut win, &mut pe, fp, &pool);
                         } else {
-                            dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut win, &mut pe);
+                            let b = i - cl_chunks.len() - nb;
+                            let (f, pt) = fp.unwrap();
+                            let r = fast::pass_a(b, &fev, f, pt, &links, shift, &mut slots, &mut pe);
+                            let _ = bucket_a[b].set(r);
                         }
-                        if is_click { tc += tt.elapsed().as_secs_f64(); } else { td += tt.elapsed().as_secs_f64(); }
                     }
                     pe.finish();
                     pc.finish();
-                    (pe, pc, o)
+                    fc.finish();
+                    (pe, pc, fc, o)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    lap("dedup + clicks");
-    for (_, _, o) in &d_parts {
+    lap("dedup + clicks + pass A");
+    for (_, _, _, o) in &d_parts {
         pool.extend(o.iter().copied());
     }
-    let mut pev = Vec::with_capacity(nt);
-    let mut pcl = Vec::with_capacity(nt);
-    for (a, b, _) in d_parts {
+    let mut pev = Vec::with_capacity(2 * nt);
+    let mut pcl = Vec::with_capacity(2 * nt);
+    let mut fcl = Vec::with_capacity(nt);
+    for (a, b, c, _) in d_parts {
         pev.push(a);
         pcl.push(b);
+        fcl.push(c);
     }
+    let _ = ishift;
 
-    // P: person buckets, largest first
-    let mut order: Vec<(usize, usize)> = (0..nb).map(|b| (pev.iter().map(|t| t.len(b)).sum::<usize>(), b)).collect();
-    order.sort_unstable_by(|a, b| b.cmp(a));
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap_or_else(|_| die("mkdir user_daily"));
     std::fs::create_dir_all(&cd).unwrap_or_else(|_| die("mkdir campaign_daily"));
-    let next = AtomicUsize::new(0);
     let ncamp = ctx.camp_names.len();
+
+    // B: simple persons straight from index order
+    let mut outs: Vec<(UserOut, Acc)> = Vec::with_capacity(nt);
+    if let Some((f, pt)) = fp {
+        let plan = fast::classify(&bucket_a, f, pt);
+        lap("classified");
+        let next = AtomicUsize::new(0);
+        let b_parts: Vec<(UserOut, Acc, part::Parts<PRec>, part::Parts<CRec>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..nt)
+                .map(|_| {
+                    let (bucket_a, fcl, plan, links, pool, ctx, next) = (&bucket_a, &fcl, &plan, &links, &pool, &ctx, &next);
+                    s.spawn(move || {
+                        let mut acc = Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays };
+                        let mut uo = UserOut::default();
+                        let mut ge = part::Parts::<PRec>::new(nb, 64);
+                        let mut gc = part::Parts::<CRec>::new(nb, 32);
+                        let mut w = fast::BWork { cl: Vec::new(), ccnt: Vec::new(), cs: Vec::new(), evs: Vec::new(), name: Vec::new(), win: Win::new(ncamp, ctx.cats.len()) };
+                        let empty = fast::BucketA::default();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= nib {
+                                break;
+                            }
+                            let ba = bucket_a[i].get().unwrap_or(&empty);
+                            fast::pass_b(i, ba, fcl, f, pt, plan, links, pool, ctx, shift, &mut w, &mut acc, &mut uo, &mut ge, &mut gc);
+                        }
+                        ge.finish();
+                        gc.finish();
+                        (uo, acc, ge, gc)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (uo, acc, ge, gc) in b_parts {
+            outs.push((uo, acc));
+            pev.push(ge);
+            pcl.push(gc);
+        }
+        lap("fast persons done");
+    } else {
+        for _ in 0..nt {
+            outs.push((UserOut::default(), Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays }));
+        }
+    }
+
+    // P: generic person buckets, largest first
+    let mut order: Vec<(usize, usize)> = (0..nb).map(|b| (pev.iter().map(|t| t.len(b)).sum::<usize>(), b)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let next = AtomicUsize::new(0);
     let accs: Vec<Acc> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nt)
-            .map(|t| {
+        let hs: Vec<_> = outs
+            .into_iter()
+            .enumerate()
+            .map(|(t, (mut uo, mut acc))| {
                 let (order, pev, pcl, ctx, pool, next, ud) = (&order, &pev, &pcl, &ctx, &pool, &next, &ud);
                 s.spawn(move || {
                     let mut w = Work::new(ncamp, ctx.cats.len());
-                    let mut acc = Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays };
-                    let mut uo = UserOut::default();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= order.len() {

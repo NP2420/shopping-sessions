@@ -43,7 +43,7 @@ pub fn scramble(v: u64, key: u64) -> u64 {
 
 /// Canonical base 36 after a one-byte prefix: returns the value, or None.
 #[inline(always)]
-pub fn b36(s: &[u8], prefix: u8) -> Option<u64> {
+pub fn b36_slow(s: &[u8], prefix: u8) -> Option<u64> {
     let n = s.len();
     if n < 2 || n > 9 || s[0] != prefix {
         // 8 base-36 digits cover 40 bits (36^8 > 2^40); 9 never fit
@@ -66,6 +66,67 @@ pub fn b36(s: &[u8], prefix: u8) -> Option<u64> {
     } else {
         Some(v)
     }
+}
+
+
+const fn shuf_table() -> [[u8; 16]; 9] {
+    // for m digits, lane j of 0..8 takes digit j - (8 - m), or zero
+    let mut t = [[0x80u8; 16]; 9];
+    let mut m = 1;
+    while m <= 8 {
+        let mut j = 0;
+        while j < 8 {
+            if j + m >= 8 {
+                t[m][j] = (j + m - 8) as u8;
+            }
+            j += 1;
+        }
+        m += 1;
+    }
+    t
+}
+static SHUF: [[u8; 16]; 9] = shuf_table();
+
+/// SIMD version of `b36_slow`.
+#[inline(always)]
+pub fn b36(s: &[u8], prefix: u8) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let n = s.len();
+        let p = s.as_ptr();
+        if n < 2 || n > 9 || *p != prefix {
+            return None;
+        }
+        if (p as usize & 4095) > 4096 - 17 {
+            return b36_slow(s, prefix);
+        }
+        let m = n - 1;
+        if *p.add(1) == b'0' && m > 1 {
+            return None;
+        }
+        let v = _mm_loadu_si128(p.add(1) as *const __m128i);
+        let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let inb = _mm_cmpgt_epi8(_mm_set1_epi8(m as i8), idx);
+        let dx = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let dok = _mm_cmpeq_epi8(_mm_min_epu8(dx, _mm_set1_epi8(9)), dx);
+        let lx = _mm_sub_epi8(v, _mm_set1_epi8((b'a' - 10) as i8));
+        let lok = _mm_cmpeq_epi8(_mm_min_epu8(_mm_sub_epi8(lx, _mm_set1_epi8(10)), _mm_set1_epi8(25)), _mm_sub_epi8(lx, _mm_set1_epi8(10)));
+        let ok = _mm_or_si128(dok, lok);
+        if _mm_movemask_epi8(_mm_or_si128(ok, _mm_xor_si128(inb, _mm_set1_epi8(-1)))) != 0xFFFF {
+            return None;
+        }
+        let d = _mm_or_si128(_mm_and_si128(dok, dx), _mm_andnot_si128(dok, lx));
+        let d = _mm_shuffle_epi8(d, _mm_loadu_si128(SHUF[m].as_ptr() as *const __m128i));
+        let pairs = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0124)); // d0*36 + d1
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510)); // pair0*1296 + pair1
+        let q0 = _mm_cvtsi128_si32(quads) as u32 as u64;
+        let q1 = _mm_extract_epi32(quads, 1) as u32 as u64;
+        let val = q0 * 1_679_616 + q1;
+        return if val > M40 { None } else { Some(val) };
+    }
+    #[allow(unreachable_code)]
+    b36_slow(s, prefix)
 }
 
 /// Inverse of `b36`: writes prefix + base 36 into `out`.
@@ -187,5 +248,35 @@ mod tests {
         s.clear();
         b36_write(&mut s, b'e', M40);
         assert_eq!(b36(&s, b'e'), Some(M40));
+    }
+
+    #[test]
+    fn simd_b36_matches() {
+        let mut x: u64 = 0xdead_beef_1234_5678;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789abcdefghijklmnopqrstuvwxyzAZ_-/:{`@";
+        let mut buf = vec![0u8; 8192];
+        for _ in 0..3_000_000 {
+            let n = (rnd() % 12) as usize;
+            let off = (rnd() % 8100) as usize;
+            for i in 0..n {
+                let r = rnd();
+                buf[off + i] = if i == 0 && r % 4 != 0 { b'u' } else if r % 7 == 0 { alpha[(r as usize >> 5) % alpha.len()] } else { alpha[(r as usize >> 5) % 36] };
+            }
+            let sl = &buf[off..off + n];
+            assert_eq!(b36(sl, b'u'), b36_slow(sl, b'u'), "{:?}", String::from_utf8_lossy(sl));
+        }
+        for v in [0u64, 1, 35, 36, 1295, 1296, 1_679_615, 1_679_616, M40, M40 + 1, 2_821_109_907_455] {
+            let mut st = vec![b'u'];
+            let mut t = Vec::new();
+            b36_write(&mut t, b'x', v);
+            st.extend_from_slice(&t[1..]);
+            assert_eq!(b36(&st, b'u'), b36_slow(&st, b'u'), "{v}");
+        }
     }
 }

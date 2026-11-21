@@ -591,7 +591,11 @@ fn dedup_bucket(
     table.clear();
     table.resize(cap, (EMPTY, std::ptr::null()));
     for t in ev {
-        for r in &t[b] {
+        let v = &t[b];
+        for (j, r) in v.iter().enumerate() {
+            if j + 8 < v.len() {
+                prefetch(unsafe { table.as_ptr().add(ids::mix(v.get_unchecked(j + 8).eid) as usize & mask) } as *const u8);
+            }
             let mut i = (ids::mix(r.eid) as usize) & mask;
             loop {
                 let s = unsafe { table.get_unchecked_mut(i) };
@@ -712,8 +716,9 @@ fn person_bucket(
     if nev == 0 {
         return;
     }
-    let cap = (nev * 2).next_power_of_two();
-    let mask = cap - 1;
+    // people per bucket are far fewer than events: start small and grow at half load
+    let mut cap = (nev / 8).next_power_of_two().max(64);
+    let mut mask = cap - 1;
     w.tab.clear();
     w.tab.resize(cap, (EMPTY, 0));
     w.lids.clear();
@@ -732,6 +737,19 @@ fn person_bucket(
                     *s = (r.pk, l);
                     w.pks.push(r.pk);
                     w.cnt.push(0);
+                    if w.pks.len() * 2 > cap {
+                        cap *= 2;
+                        mask = cap - 1;
+                        w.tab.clear();
+                        w.tab.resize(cap, (EMPTY, 0));
+                        for (l2, &k) in w.pks.iter().enumerate() {
+                            let mut j = ids::mix(k) as usize & mask;
+                            while w.tab[j].0 != EMPTY {
+                                j = (j + 1) & mask;
+                            }
+                            w.tab[j] = (k, l2 as u32);
+                        }
+                    }
                     break l;
                 }
                 i = (i + 1) & mask;

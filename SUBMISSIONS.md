@@ -20,3 +20,5 @@ Scorer v5 (Nov 21 ~9 PM): board reset; 1 in 8 IDs now carry a 32-hex suffix and 
 | 11 | 697705f | 1.0995 s | correct | + link table as one-line buckets of four (SIMD compare, branch-free hit select), dedup scan without emptiness branches |
 | 12 | 3b0e3bf | 1.1216 s | correct | + dedup table in four-slot lines, pool in four-slot lines sized for long user IDs (noise vs #11?) |
 | 13 | 6695c19 | 1.3105 s | correct | + clicks placed in person partitions during parsing, person table lines, radix for big persons. 0.2 s worse than #11: regression or a slow machine? |
+| 14 | 6695c19 | 1.1104 s | correct | same commit as #13: #13's 1.31 s was a slow machine (about 18% spread between two runs of one commit) |
+| 15 | 6063438 (branch exp-nothp) | 1.3184 s | correct | #14 without huge-page advice: slower, keep THP |

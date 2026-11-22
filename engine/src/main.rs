@@ -1481,7 +1481,7 @@ fn main() {
                         let mut uo = UserOut::with_rows(urows);
                         let mut ge = part::Parts::<PRec>::new(nb, 64);
                         let mut gc = part::Parts::<CRec>::new(nb, 32);
-                        let mut w = fast::BWork { cl: Vec::new(), ca: Vec::new(), ccnt: Vec::new(), cs: Vec::new(), evs: Vec::new(), name: Vec::new(), win: Win::new(ncamp, ctx.cats.len()) };
+                        let mut w = fast::BWork { sb: Vec::new(), cl: Vec::new(), ca: Vec::new(), ccnt: Vec::new(), cs: Vec::new(), evs: Vec::new(), name: Vec::new(), win: Win::new(ncamp, ctx.cats.len()) };
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             if i >= nib {

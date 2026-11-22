@@ -357,6 +357,7 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
 }
 
 pub struct BWork {
+    pub sb: Vec<u64>,
     pub cl: Vec<(u32, u32, CItem)>,
     pub ca: Vec<u32>,
     pub ccnt: Vec<u32>,
@@ -392,7 +393,21 @@ pub fn pass_b(
     // clicks of persons in [lo, hi]
     w.cl.clear();
     if lo <= hi {
-        let simple = |p: u32| !pt.complex(p as usize) && plan.home[p as usize] == b as u32;
+        // which persons in [lo, hi] this bucket finishes: one bit each
+        w.sb.clear();
+        w.sb.resize(((hi - lo) as usize >> 6) + 1, 0);
+        for r in &ba.runs {
+            let p = r.p;
+            if p >= lo && p <= hi && !pt.complex(p as usize) && plan.home[p as usize] == b as u32 {
+                let k = (p - lo) as usize;
+                w.sb[k >> 6] |= 1 << (k & 63);
+            }
+        }
+        let sb = &w.sb;
+        let simple = |p: u32| {
+            let k = (p - lo) as usize;
+            (sb[k >> 6] >> (k & 63)) & 1 != 0
+        };
         for cb in (lo >> fast.cshift) as usize..=((hi >> fast.cshift) as usize).min(fast.ncb - 1) {
             for t in fc {
                 let (x1, x2) = t.get(cb);
@@ -435,6 +450,7 @@ pub fn pass_b(
         }
     }
     let nruns = ba.runs.len();
+    let mut xi = extras.partition_point(|x| x.0 < lo);
     for (ri, r) in ba.runs.iter().enumerate() {
         let p = r.p as usize;
         let run = &ba.w[r.start as usize..(r.start + r.len) as usize];
@@ -474,8 +490,19 @@ pub fn pass_b(
             }
         }
         // events of this person that took the generic dedup route
-        let xa = extras.partition_point(|x| x.0 < r.p);
-        let xz = extras.partition_point(|x| x.0 <= r.p);
+        // extras are sorted by person and runs mostly ascend: walk forward, search if not
+        if xi > extras.len() || (xi > 0 && extras[xi - 1].0 >= r.p) {
+            xi = extras.partition_point(|x| x.0 < r.p);
+        }
+        while xi < extras.len() && extras[xi].0 < r.p {
+            xi += 1;
+        }
+        let xa = xi;
+        let mut xz = xa;
+        while xz < extras.len() && extras[xz].0 == r.p {
+            xz += 1;
+        }
+        xi = xz;
         if xa < xz {
             w.evs.extend(extras[xa..xz].iter().map(|x| ((x.2 as u64) << 32) | x.3 as u64));
             w.evs.sort_unstable();

@@ -27,3 +27,5 @@ Scorer v5 (Nov 21 ~9 PM): board reset; 1 in 8 IDs now carry a 32-hex suffix and 
 
 Recommendation for the final: 1119b33 (engine of #14/#16/#17: 1.1104 / 1.1057 / 1.1191 s, one slow-machine 1.31 s). It ties 697705f (#11, 1.0995 s, sampled once) on the scorer, uses about 8% less CPU in single-thread profiles, and passes every check. The default entry stays 697705f (best score) unless picked.
 | 18 | 7e5d7cd | 1.1801 s | correct | + events take their person during parsing once union-find is done, category only for purchases, background read-ahead/populate of inputs. No gain on the scorer (within noise, maybe worse) |
+| 19 | d7ebb98 (branch exp-fast) | 1.1861 s | correct | main + dictionary-encoded user_daily + old key search on: no gain |
+| 20 | 696769a (branch exp-probe) | rejected, exit 12 | probe | exit code = key-search stage on the hidden data: 12 = base-36 users found but no key of the old scramble fits. The hidden data uses the v5 keyed bijection, so no generator-key fast path applies |

@@ -30,7 +30,6 @@ pub struct FRec {
     pub user: u64,
     pub ts: u32, // u32::MAX = invalid copy
     pub pc: u32,
-    pub _p: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -41,7 +40,6 @@ pub struct FClk {
     pub ts: u32,
     pub camp: u32,
     pub ck: u64,
-    pub _p: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -237,7 +235,7 @@ pub fn pass_a(
     // a slot belongs to this bucket only if its index is in this bucket's range, so slots left
     // over from an earlier bucket read as empty and need no clearing
     if slots.len() != size {
-        let empty = FRec { idx: u32::MAX, ing: 0, user: 0, ts: 0, pc: 0, _p: 0 };
+        let empty = FRec { idx: u32::MAX, ing: 0, user: 0, ts: 0, pc: 0 };
         slots.clear();
         slots.resize(size, empty);
     }

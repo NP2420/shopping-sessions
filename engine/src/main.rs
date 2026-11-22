@@ -452,7 +452,7 @@ fn parse_events_g<const PUSH: bool>(
                     tsr = (t - ws) as u32;
                     pc = (price << 8) | ctx.cat_of(f[5]) as u32;
                 }
-                let r = fast::FRec { idx, ing, user, ts: tsr, pc, _p: 0 };
+                let r = fast::FRec { idx, ing, user, ts: tsr, pc };
                 if PUSH {
                     fout.push((idx >> fa.ishift) as usize, r);
                 } else {
@@ -530,7 +530,7 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, ovf: &mut Ovf, tmp: &mut Vec<CRec>, fa: Opt
             if let Some(n) = fa.user_number(f[1]) {
                 let p = (n >> gen::ALIAS_BITS) as u32;
                 let a = (n & ((1 << gen::ALIAS_BITS) - 1)) as u32;
-                fout.push((p >> fa.cshift) as usize, fast::FClk { p, a, ts: (t - lo) as u32, camp, ck, _p: 0 });
+                fout.push((p >> fa.cshift) as usize, fast::FClk { p, a, ts: (t - lo) as u32, camp, ck });
                 return;
             }
         }

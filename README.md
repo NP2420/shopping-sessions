@@ -30,6 +30,6 @@ cd engine && cargo test --release && cargo build --release
 scripts/check.sh engine/target/release/ss   # fixtures, dev set, generated seeds vs the reference
 ```
 
-`SS_VERBOSE=1` prints phase timings to stderr; `SS_GENERIC=1` turns the fast path off.
+`SS_VERBOSE=1` prints phase timings to stderr; `SS_FAST=1` turns on the old dense-ID fast path (it needs the pre-v5 generator, whose IDs were not keyed per seed).
 `scripts/mutate.py` and `scripts/longlines.py` make rule-legal oddities (winning duplicates under
 other users, cross-person links, upper-case IDs, long lines) for differential tests.

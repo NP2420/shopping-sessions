@@ -1297,9 +1297,9 @@ fn main() {
     let per = est_events / nt / nb * 5 / 4 + 32;
     lap("setup");
 
-    // L: links, with the generator-key search on its own thread (SS_GENERIC=1 turns it off)
+    // L: links, with the old generator-key search on its own thread when SS_FAST=1 (v5 IDs are keyed per seed)
     let next = AtomicUsize::new(0);
-    let want_keys = std::env::var_os("SS_GENERIC").is_none();
+    let want_keys = std::env::var_os("SS_FAST").is_some();
     let pool = Pool::new(ev_bytes / 2048);
     let (link_parts, keys): (Vec<Vec<(u64, u64)>>, Option<gen::Keys>) = std::thread::scope(|s| {
         let kh = s.spawn(|| if want_keys { recover_keys(&ev_files) } else { None });
@@ -1324,7 +1324,7 @@ fn main() {
     let edges: Vec<Vec<(u64, u64)>> = link_parts;
     lap("links parsed");
 
-    // keys of the generator, for the dense-ID fast path (SS_GENERIC=1 turns it off)
+    // keys of the generator, for the dense-ID fast path (only with SS_FAST=1)
     let fa: Option<fast::Fast> = keys.map(|k| fast::Fast::new(k, ev_bytes));
     lap(if fa.is_some() { "keys recovered" } else { "no keys: generic only" });
     let fa = fa.as_ref();

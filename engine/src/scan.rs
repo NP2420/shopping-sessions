@@ -63,6 +63,23 @@ fn unquote<const N: usize>(f: &mut [&[u8]; N], q: u32) -> bool {
     stripped == q
 }
 
+/// `unquote` for a line that does not end at end of file: every field is followed by a separator
+/// and preceded by one (or the previous line's newline), so the first and last byte of an empty
+/// field can be read without a length test; they are separators, never quotes.
+#[inline(always)]
+fn unquote_inner<const N: usize>(f: &mut [&[u8]; N], q: u32) -> bool {
+    let mut stripped = 0u32;
+    for x in f.iter_mut() {
+        let l = x.len();
+        let p = x.as_ptr();
+        let (a, z) = unsafe { (*p, *p.wrapping_add(l).wrapping_sub(1)) };
+        let w = ((a == b'"') & (z == b'"') & (l >= 2)) as usize;
+        *x = unsafe { std::slice::from_raw_parts(p.add(w), l - 2 * w) };
+        stripped += 2 * w as u32;
+    }
+    stripped == q
+}
+
 /// Calls `f` for every well-formed data line starting in [start, end) of `d`.
 /// The first line of the file (start == 0) is the header and is skipped.
 #[inline(always)]
@@ -116,7 +133,8 @@ pub fn lines<const N: usize>(d: &'static [u8], start: usize, end: usize, mut f: 
                     a = seps[k] + 1;
                 }
                 fl[N - 1] = unsafe { d.get_unchecked(a..p.min(n)) };
-                if q == 0 || unquote(&mut fl, q) {
+                let ok = q == 0 || if p < n { unquote_inner(&mut fl, q) } else { unquote(&mut fl, q) };
+                if ok {
                     f(&mut fl);
                 }
             }

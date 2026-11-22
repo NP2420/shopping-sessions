@@ -47,7 +47,8 @@ fn init() -> usize {
         }
         // align the usable start to 2 MiB so huge pages line up
         let start = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
-        libc::madvise(start as *mut libc::c_void, REGION - (start - p as usize), libc::MADV_HUGEPAGE);
+        let _ = libc::MADV_HUGEPAGE; // experiment: no huge-page advice
+        if false { libc::madvise(start as *mut libc::c_void, REGION - (start - p as usize), libc::MADV_HUGEPAGE); }
         match BASE.compare_exchange(0, start, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => start,
             Err(other) => {

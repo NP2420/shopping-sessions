@@ -14,7 +14,7 @@
 //! * no event of the person may take the generic route (a non-canonical event ID, for instance);
 //! * the bucket that owns its run must also own its clicks.
 
-use crate::gen::{self, b36, unscramble, Keys, ALIAS_BITS, M40};
+use crate::gen::{self, b36, unscramble, Keys, ALIAS_BITS};
 use crate::ids::{self, Pool, EMPTY, OVF};
 use crate::part::Parts;
 use crate::*;
@@ -134,69 +134,59 @@ impl PTab {
     }
 }
 
-/// Builds per-person facts from the union-find table: which aliases are linked, the component
-/// name, and whether the component holds anything besides that person's own IDs.
-pub fn build_ptab(links: &LinkTab, pool: &Pool, fast: &Fast) -> PTab {
+/// Builds per-person facts from the union-find slots while each slot's value is still its root's
+/// slot index: which aliases are linked, the component name, and whether the component holds
+/// anything besides that person's own IDs.
+pub fn ptab_from_roots(sl: &[[u64; 2]], pool: &Pool, fast: &Fast) -> PTab {
     let np = fast.np;
     let mut lmask = vec![0u64; np];
     let mut lname = vec![EMPTY; np];
     let flags: Vec<AtomicU8> = (0..np).map(|_| AtomicU8::new(0)).collect();
-    // owner of each component (by name): a person index, or MIXED
+    const NONE: u32 = u32::MAX - 1;
     const MIXED: u32 = u32::MAX;
-    let cap = links.slots.len().max(2);
-    let mask = cap - 1;
-    let mut own: Vec<(u64, u32)> = vec![(EMPTY, 0); cap];
+    let mut owner = vec![NONE; sl.len()];
+    let mut num = vec![u64::MAX; sl.len()];
     let mut buf = Vec::with_capacity(16);
-    let owner_slot = |own: &mut Vec<(u64, u32)>, name: u64| -> usize {
-        let mut i = ids::mix(name) as usize & mask;
-        loop {
-            if own[i].0 == name || own[i].0 == EMPTY {
-                return i;
-            }
-            i = (i + 1) & mask;
-        }
-    };
-    for s in links.slots.iter() {
-        let (k, name) = (s[0], s[1]);
+    for (i, s) in sl.iter().enumerate() {
+        let k = s[0];
         if k == EMPTY {
             continue;
         }
-        buf.clear();
-        ids::decode_into(k, pool, &mut buf);
-        let who = match fast.user_number(&buf) {
+        let n = if k & OVF == 0 {
+            gen::packed_b36(k, b'u').map(|o| unscramble(o, fast.keys.user)).filter(|&n| (n >> ALIAS_BITS) < np as u64)
+        } else {
+            buf.clear();
+            ids::decode_into(k, pool, &mut buf);
+            fast.user_number(&buf)
+        };
+        let who = match n {
             Some(n) => {
-                let p = (n >> ALIAS_BITS) as usize;
-                let a = (n & ((1 << ALIAS_BITS) - 1)) as u32;
-                if a < 64 {
-                    if lmask[p] == 0 {
-                        lname[p] = name;
-                    } else if lname[p] != name {
-                        flags[p].store(COMPLEX, Ordering::Relaxed);
-                    }
-                    lmask[p] |= 1 << a;
-                } else {
-                    flags[p].store(COMPLEX, Ordering::Relaxed);
-                }
-                p as u32
+                num[i] = n;
+                (n >> ALIAS_BITS) as u32
             }
             None => MIXED,
         };
-        let i = owner_slot(&mut own, name);
-        if own[i].0 == EMPTY {
-            own[i] = (name, who);
-        } else if own[i].1 != who {
-            own[i].1 = MIXED;
-        }
+        let r = s[1] as usize;
+        let o = &mut owner[r];
+        *o = if *o == NONE || *o == who { who } else { MIXED };
     }
-    for p in 0..np {
-        if lmask[p] != 0 {
-            let i = owner_slot(&mut own, lname[p]);
-            if own[i].1 != p as u32 {
-                flags[p].store(COMPLEX, Ordering::Relaxed);
-            }
+    for (i, s) in sl.iter().enumerate() {
+        let n = num[i];
+        if n == u64::MAX {
+            continue;
         }
+        let p = (n >> ALIAS_BITS) as usize;
+        let a = (n & ((1 << ALIAS_BITS) - 1)) as u32;
+        let r = s[1] as usize;
+        let name = sl[r][0];
+        if a >= 64 || owner[r] != p as u32 || (lmask[p] != 0 && lname[p] != name) {
+            flags[p].store(COMPLEX, Ordering::Relaxed);
+        }
+        if a < 64 {
+            lmask[p] |= 1 << a;
+        }
+        lname[p] = name;
     }
-    let _ = M40;
     PTab { lmask, lname, flags }
 }
 

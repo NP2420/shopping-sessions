@@ -567,18 +567,18 @@ fn prefetch(p: *const u8) {
 /// Union-find directly in an open-addressing table: a node is its slot. The root of a set is
 /// always its smallest ID, so at the end every slot's value becomes its person's name, and the
 /// same table serves `get` (an ID not in the table is a person on its own).
-fn build_links(edges: &[Vec<(u64, u64)>], pool: &Pool) -> LinkTab {
+fn build_links(edges: &[Vec<(u64, u64)>], pool: &Pool, fa: Option<&fast::Fast>) -> (LinkTab, Option<fast::PTab>) {
     let ne: usize = edges.iter().map(|e| e.len()).sum();
     let mut cap = (ne * 2).next_power_of_two().max(16);
     loop {
-        if let Some(t) = try_links(edges, pool, cap) {
+        if let Some(t) = try_links(edges, pool, cap, fa) {
             return t;
         }
         cap *= 2;
     }
 }
 
-fn try_links(edges: &[Vec<(u64, u64)>], pool: &Pool, cap: usize) -> Option<LinkTab> {
+fn try_links(edges: &[Vec<(u64, u64)>], pool: &Pool, cap: usize, fa: Option<&fast::Fast>) -> Option<(LinkTab, Option<fast::PTab>)> {
     let mask = cap - 1;
     let limit = cap / 10 * 9;
     // slot = [key, parent slot]; parent slot index stored in the value word during the build
@@ -645,13 +645,15 @@ fn try_links(edges: &[Vec<(u64, u64)>], pool: &Pool, cap: usize) -> Option<LinkT
             sl[i][1] = r as u64;
         }
     }
+    // here every slot's value is its root's slot index: the fast path's person table needs that
+    let pt = fa.map(|f| fast::ptab_from_roots(&sl, pool, f));
     for i in 0..cap {
         if sl[i][0] != EMPTY {
             let r = sl[i][1] as usize;
             sl[i][1] = sl[r][0];
         }
     }
-    Some(LinkTab { slots: sl, mask })
+    Some((LinkTab { slots: sl, mask }, pt))
 }
 
 // ---------------------------------------------------------------- dedup
@@ -1284,12 +1286,11 @@ fn main() {
     let (ev_parts, (links, ptab)): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, Ovf)>, (LinkTab, Option<fast::PTab>)) = std::thread::scope(|s| {
         let uf = s.spawn(|| {
             let t = std::time::Instant::now();
-            let r = build_links(&edges, &pool);
-            let pt = fa.map(|f| fast::build_ptab(&r, &pool, f));
+            let r = build_links(&edges, &pool, fa);
             if verbose {
-                eprintln!("uf {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+                eprintln!("uf + ptab {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             }
-            (r, pt)
+            r
         });
         let hs: Vec<_> = (0..nt)
             .map(|_| {
@@ -1440,6 +1441,11 @@ fn main() {
 
     // P: generic person buckets, largest first
     let mut order: Vec<(usize, usize)> = (0..nb).map(|b| (pev.iter().map(|t| t.len(b)).sum::<usize>(), b)).collect();
+    if verbose {
+        let ge: usize = order.iter().map(|x| x.0).sum();
+        let gc: usize = (0..nb).map(|b| pcl.iter().map(|t| t.len(b)).sum::<usize>()).sum();
+        eprintln!("generic events {ge}, generic clicks {gc}");
+    }
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
     let accs: Vec<Acc> = std::thread::scope(|s| {

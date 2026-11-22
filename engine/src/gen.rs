@@ -129,6 +129,52 @@ pub fn b36(s: &[u8], prefix: u8) -> Option<u64> {
     b36_slow(s, prefix)
 }
 
+const fn digit_of_code() -> [u8; 64] {
+    // ids.rs codes: '0'..'9' = 1..10, 'A'..'Z' = 11..36, '_' = 37, 'a'..'z' = 38..63
+    let mut t = [255u8; 64];
+    let mut i = 0;
+    while i < 10 {
+        t[1 + i] = i as u8;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < 26 {
+        t[38 + j] = 10 + j as u8;
+        j += 1;
+    }
+    t
+}
+static DIGIT: [u8; 64] = digit_of_code();
+
+/// `b36` of the string behind a packed key (see ids.rs), without unpacking it.
+pub fn packed_b36(k: u64, prefix: u8) -> Option<u64> {
+    let code = |i: u32| ((k >> (54 - 6 * i)) & 63) as usize;
+    if crate::ids::DECODE[code(0)] != prefix || code(0) == 0 {
+        return None;
+    }
+    let mut v = 0u64;
+    let mut n = 0;
+    for i in 1..10 {
+        let c = code(i);
+        if c == 0 {
+            break;
+        }
+        let d = DIGIT[c];
+        if d == 255 {
+            return None;
+        }
+        if n == 0 && d == 0 && code(i + 1) != 0 {
+            return None; // leading zero
+        }
+        v = v * 36 + d as u64;
+        n += 1;
+    }
+    if n == 0 || n > 8 || v > M40 {
+        return None;
+    }
+    Some(v)
+}
+
 /// Inverse of `b36`: writes prefix + base 36 into `out`.
 pub fn b36_write(out: &mut Vec<u8>, prefix: u8, mut v: u64) {
     out.push(prefix);
@@ -270,6 +316,11 @@ mod tests {
             }
             let sl = &buf[off..off + n];
             assert_eq!(b36(sl, b'u'), b36_slow(sl, b'u'), "{:?}", String::from_utf8_lossy(sl));
+        }
+        for w in [&b"u0"[..], b"u00", b"u1a", b"uzzzzzzzz", b"u1", b"U1", b"uA", b"u_1", b"u12345678", b"u123456789"] {
+            if let Some(k) = crate::ids::pack(w) {
+                assert_eq!(packed_b36(k, b'u'), b36_slow(w, b'u'), "{:?}", String::from_utf8_lossy(w));
+            }
         }
         for v in [0u64, 1, 35, 36, 1295, 1296, 1_679_615, 1_679_616, M40, M40 + 1, 2_821_109_907_455] {
             let mut st = vec![b'u'];

@@ -506,9 +506,7 @@ fn parse_clicks(
             if let Some(n) = fa.user_number(f[1]) {
                 let p = (n >> gen::ALIAS_BITS) as u32;
                 let a = (n & ((1 << gen::ALIAS_BITS) - 1)) as u32;
-                if !pt.alias_ok(p as usize, a) {
-                    pt.set_complex(p as usize);
-                }
+                let _ = pt; // the alias check happens in pass B, per person
                 fout.push((p >> fa.cshift) as usize, fast::FClk { p, a, ts: (t - lo) as u32, camp, ck, _p: 0 });
                 return;
             }
@@ -1434,7 +1432,7 @@ fn main() {
                         let mut uo = UserOut::default();
                         let mut ge = part::Parts::<PRec>::new(nb, 64);
                         let mut gc = part::Parts::<CRec>::new(nb, 32);
-                        let mut w = fast::BWork { cl: Vec::new(), ccnt: Vec::new(), cs: Vec::new(), evs: Vec::new(), name: Vec::new(), win: Win::new(ncamp, ctx.cats.len()) };
+                        let mut w = fast::BWork { cl: Vec::new(), ca: Vec::new(), ccnt: Vec::new(), cs: Vec::new(), evs: Vec::new(), name: Vec::new(), win: Win::new(ncamp, ctx.cats.len()) };
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             if i >= nib {

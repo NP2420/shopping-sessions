@@ -234,16 +234,20 @@ pub fn pass_a(
 ) -> BucketA {
     let size = 1usize << fast.ishift;
     let base = (b << fast.ishift) as u32;
-    let empty = FRec { idx: u32::MAX, ing: 0, user: 0, ts: 0, pc: 0, _p: 0 };
-    slots.clear();
-    slots.resize(size, empty);
+    // a slot belongs to this bucket only if its index is in this bucket's range, so slots left
+    // over from an earlier bucket read as empty and need no clearing
+    if slots.len() != size {
+        let empty = FRec { idx: u32::MAX, ing: 0, user: 0, ts: 0, pc: 0, _p: 0 };
+        slots.clear();
+        slots.resize(size, empty);
+    }
     let mut any = false;
     for t in fp {
         let (x1, x2) = t.get(b);
         for r in x1.iter().chain(x2) {
             any = true;
             let s = unsafe { slots.get_unchecked_mut((r.idx - base) as usize) };
-            if s.idx == u32::MAX || r.ing < s.ing {
+            if (s.idx >> fast.ishift) != (r.idx >> fast.ishift) || s.idx == u32::MAX || r.ing < s.ing {
                 *s = *r;
             }
         }
@@ -255,7 +259,7 @@ pub fn pass_a(
     let amask = (1u64 << ALIAS_BITS) - 1;
     let mut prev_ts = 0u32;
     for s in slots.iter() {
-        if s.idx == u32::MAX || s.ts == u32::MAX {
+        if s.idx == u32::MAX || (s.idx >> fast.ishift) as usize != b || s.ts == u32::MAX {
             continue;
         }
         if s.user & UFLAG == 0 {
@@ -349,7 +353,8 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
 }
 
 pub struct BWork {
-    pub cl: Vec<(u32, CItem)>,
+    pub cl: Vec<(u32, u32, CItem)>,
+    pub ca: Vec<u32>,
     pub ccnt: Vec<u32>,
     pub cs: Vec<CItem>,
     pub evs: Vec<u64>,
@@ -392,7 +397,7 @@ pub fn pass_b(
                         continue;
                     }
                     if simple(c.p) {
-                        w.cl.push((c.p, CItem { ts: c.ts, camp: c.camp, ck: c.ck }));
+                        w.cl.push((c.p, c.a, CItem { ts: c.ts, camp: c.camp, ck: c.ck }));
                     } else {
                         let num = ((c.p as u64) << ALIAS_BITS) | c.a as u64;
                         let pk = links.get(fast.user_key(num));
@@ -406,7 +411,7 @@ pub fn pass_b(
     let span = if lo <= hi { (hi - lo + 1) as usize } else { 0 };
     w.ccnt.clear();
     w.ccnt.resize(span + 1, 0);
-    for &(p, _) in &w.cl {
+    for &(p, _, _) in &w.cl {
         w.ccnt[(p - lo) as usize + 1] += 1;
     }
     for i in 1..w.ccnt.len() {
@@ -414,11 +419,14 @@ pub fn pass_b(
     }
     w.cs.clear();
     w.cs.resize(w.cl.len(), CItem { ts: 0, camp: 0, ck: 0 });
+    w.ca.clear();
+    w.ca.resize(w.cl.len(), 0);
     {
         let mut pos = w.ccnt.clone();
-        for &(p, c) in &w.cl {
+        for &(p, a, c) in &w.cl {
             let k = (p - lo) as usize;
             w.cs[pos[k] as usize] = c;
+            w.ca[pos[k] as usize] = a;
             pos[k] += 1;
         }
     }
@@ -469,7 +477,22 @@ pub fn pass_b(
             w.evs.sort_unstable();
         }
         let k = (r.p - lo) as usize;
-        let cls = &mut w.cs[w.ccnt[k] as usize..w.ccnt[k + 1] as usize];
+        let (ca0, ca1) = (w.ccnt[k] as usize, w.ccnt[k + 1] as usize);
+        if !w.ca[ca0..ca1].iter().all(|&a| pt.alias_ok(p, a)) {
+            // a click by an ID outside the person's component: finish this person generically
+            let ppk = if pt.linked(p) { pt.lname[p] } else { fast.user_key((p as u64) << ALIAS_BITS) };
+            for &e in &w.evs {
+                gen_ev.push(bucket(ppk, shift), PRec { pk: ppk, ts: (e >> 32) as u32, pc: e as u32 });
+            }
+            for j in ca0..ca1 {
+                let a = w.ca[j];
+                let c = w.cs[j];
+                let pk = if pt.alias_ok(p, a) { ppk } else { links.get(fast.user_key(((p as u64) << ALIAS_BITS) | a as u64)) };
+                gen_cl.push(bucket(pk, shift), CRec { pk, ck: c.ck, ts: c.ts, camp: c.camp, _p: 0 });
+            }
+            continue;
+        }
+        let cls = &mut w.cs[ca0..ca1];
         if cls.len() > 1 {
             cls.sort_unstable_by(|x, y| {
                 x.ts.cmp(&y.ts).then_with(|| {

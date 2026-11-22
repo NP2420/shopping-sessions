@@ -821,6 +821,22 @@ impl Win {
     }
 }
 
+impl UserOut {
+    /// Buffers sized for about `rows` rows, so they never regrow (a regrow copies).
+    fn with_rows(rows: usize) -> Self {
+        UserOut {
+            rows: 0,
+            uid: pq::Bytes(Vec::with_capacity(rows * 16)),
+            day: pq::Bytes(Vec::with_capacity(rows * 4)),
+            ses: pq::Bytes(Vec::with_capacity(rows * 4)),
+            evn: pq::Bytes(Vec::with_capacity(rows * 4)),
+            rev: pq::Bytes(Vec::with_capacity(rows * 8)),
+            topd: Vec::with_capacity(rows),
+            topv: pq::Bytes(Vec::with_capacity(rows * 6)),
+        }
+    }
+}
+
 impl Work {
     fn new(ncamp: usize, ncat: usize) -> Self {
         Work {
@@ -1435,6 +1451,7 @@ fn main() {
     std::fs::create_dir_all(&cd).unwrap_or_else(|_| die("mkdir campaign_daily"));
     let ncamp = ctx.camp_names.len();
 
+    let urows = est_events / 7 / nt + 1024; // user-day rows per thread, with headroom
     // B: simple persons straight from index order
     let mut outs: Vec<(UserOut, Acc)> = Vec::with_capacity(nt);
     if let Some((f, pt)) = fp {
@@ -1461,7 +1478,7 @@ fn main() {
                     let (bucket_a, fcl, plan, links, pool, ctx, next) = (&bucket_a, &fcl, &plan, &links, &pool, &ctx, &next);
                     s.spawn(move || {
                         let mut acc = Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ass: vec![0; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays };
-                        let mut uo = UserOut::default();
+                        let mut uo = UserOut::with_rows(urows);
                         let mut ge = part::Parts::<PRec>::new(nb, 64);
                         let mut gc = part::Parts::<CRec>::new(nb, 32);
                         let mut w = fast::BWork { cl: Vec::new(), ca: Vec::new(), ccnt: Vec::new(), cs: Vec::new(), evs: Vec::new(), name: Vec::new(), win: Win::new(ncamp, ctx.cats.len()) };
@@ -1488,7 +1505,7 @@ fn main() {
         lap("fast persons done");
     } else {
         for _ in 0..nt {
-            outs.push((UserOut::default(), Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ass: vec![0; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays }));
+            outs.push((UserOut::with_rows(urows), Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ass: vec![0; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays }));
         }
     }
 

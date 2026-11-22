@@ -242,6 +242,10 @@ pub fn pass_a(
         slots.resize(size, empty);
     }
     let mut any = false;
+    let mut nrec = 0usize;
+    for t in fp {
+        nrec += t.len(b);
+    }
     for t in fp {
         let (x1, x2) = t.get(b);
         for r in x1.iter().chain(x2) {
@@ -256,6 +260,8 @@ pub fn pass_a(
     if !any {
         return out;
     }
+    out.w.reserve(nrec);
+    out.runs.reserve(nrec / 16 + 16);
     let amask = (1u64 << ALIAS_BITS) - 1;
     let mut prev_ts = 0u32;
     for s in slots.iter() {

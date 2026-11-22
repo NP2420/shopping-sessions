@@ -206,7 +206,10 @@ pub fn ptab_from_roots(sl: &[[u64; 2]], pool: &Pool, fast: &Fast) -> PTab {
 /// One bucket's winners in index order, as runs of one person each.
 #[derive(Default)]
 pub struct BucketA {
-    pub w: Vec<(u32, u32, u32)>, // (ts, pc, alias)
+    pub w: Vec<u64>, // ts << 32 | pc, in index order
+    /// (position, alias) of winners whose alias decides their component: an alias outside the
+    /// person's linked set, or any winner of a person already known to be complex
+    pub bad: Vec<(u32, u32)>,
     pub runs: Vec<Run>,
     pub maxp: u32,
 }
@@ -275,8 +278,11 @@ pub fn pass_a(
         let p = (num >> ALIAS_BITS) as u32;
         let a = (num & amask) as u32;
         let pos = out.w.len() as u32;
-        out.w.push((s.ts, s.pc, a));
+        out.w.push(((s.ts as u64) << 32) | s.pc as u64);
         let aok = pt.alias_ok(p as usize, a);
+        if !aok || pt.complex(p as usize) {
+            out.bad.push((pos, a));
+        }
         match out.runs.last_mut() {
             Some(r) if r.p == p && r.start + r.len == pos => {
                 r.len += 1;
@@ -313,7 +319,7 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
         if let Some(ba) = a[b].get() {
             for (ri, r) in ba.runs.iter().enumerate() {
                 let p = r.p as usize;
-                let first_ts = ba.w[r.start as usize].0;
+                let first_ts = (ba.w[r.start as usize] >> 32) as u32;
                 if ri == 0 && matches!(prev, Some((pp, pts)) if pp == r.p && pts <= first_ts) {
                     // the same person's events go on in this bucket
                     cont[b] = true;
@@ -328,7 +334,7 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
                 home[p] = b as u32;
             }
             if let Some(r) = ba.runs.last() {
-                prev = Some((r.p, ba.w[(r.start + r.len - 1) as usize].0));
+                prev = Some((r.p, (ba.w[(r.start + r.len - 1) as usize] >> 32) as u32));
             }
             m = m.max(ba.maxp);
         }
@@ -456,18 +462,27 @@ pub fn pass_b(
         let run = &ba.w[r.start as usize..(r.start + r.len) as usize];
         let is_cont = ri == 0 && plan.cont[b];
         if pt.complex(p) || (!is_cont && (plan.home[p] != b as u32 || r.p < lo || r.p > hi)) {
-            for &(ts, pc, a) in run {
-                let num = ((p as u64) << ALIAS_BITS) | a as u64;
-                let pk = links.get(fast.user_key(num));
-                gen_ev.push(bucket(pk, shift), PRec { pk, ts, pc });
+            // generic: the person's component, or the alias's own for the exceptions
+            let ppk = if pt.linked(p) { pt.lname[p] } else { fast.user_key((p as u64) << ALIAS_BITS) };
+            let mut bi = ba.bad.partition_point(|x| x.0 < r.start);
+            for (j, &e) in run.iter().enumerate() {
+                let pos = r.start + j as u32;
+                let pk = if bi < ba.bad.len() && ba.bad[bi].0 == pos {
+                    let a = ba.bad[bi].1;
+                    bi += 1;
+                    links.get(fast.user_key(((p as u64) << ALIAS_BITS) | a as u64))
+                } else {
+                    ppk
+                };
+                gen_ev.push(bucket(pk, shift), PRec { pk, ts: (e >> 32) as u32, pc: e as u32 });
             }
             continue;
         }
         if is_cont {
             continue; // finished by the bucket where the run starts
         }
-        w.evs.clear();
-        w.evs.extend(run.iter().map(|&(ts, pc, _)| ((ts as u64) << 32) | pc as u64));
+        // the run alone, or copied together with its continuations and extras
+        let mut copied = false;
         if ri + 1 == nruns {
             // the run may go on in the following buckets
             let mut nb = b + 1;
@@ -479,8 +494,13 @@ pub fn pass_b(
                         if !plan.cont[nb] {
                             break;
                         }
+                        if !copied {
+                            w.evs.clear();
+                            w.evs.extend_from_slice(run);
+                            copied = true;
+                        }
                         let r2 = nx.runs[0];
-                        w.evs.extend(nx.w[r2.start as usize..(r2.start + r2.len) as usize].iter().map(|&(ts, pc, _)| ((ts as u64) << 32) | pc as u64));
+                        w.evs.extend_from_slice(&nx.w[r2.start as usize..(r2.start + r2.len) as usize]);
                         if nx.runs.len() > 1 {
                             break;
                         }
@@ -504,15 +524,21 @@ pub fn pass_b(
         }
         xi = xz;
         if xa < xz {
+            if !copied {
+                w.evs.clear();
+                w.evs.extend_from_slice(run);
+                copied = true;
+            }
             w.evs.extend(extras[xa..xz].iter().map(|x| ((x.2 as u64) << 32) | x.3 as u64));
             w.evs.sort_unstable();
         }
+        let evs: &[u64] = if copied { &w.evs } else { run };
         let k = (r.p - lo) as usize;
         let (ca0, ca1) = (w.ccnt[k] as usize, w.ccnt[k + 1] as usize);
         if !w.ca[ca0..ca1].iter().all(|&a| pt.alias_ok(p, a)) {
             // a click by an ID outside the person's component: finish this person generically
             let ppk = if pt.linked(p) { pt.lname[p] } else { fast.user_key((p as u64) << ALIAS_BITS) };
-            for &e in &w.evs {
+            for &e in evs {
                 gen_ev.push(bucket(ppk, shift), PRec { pk: ppk, ts: (e >> 32) as u32, pc: e as u32 });
             }
             for j in ca0..ca1 {
@@ -542,6 +568,6 @@ pub fn pass_b(
             fast.user_string((p as u64) << ALIAS_BITS, &mut w.name);
         }
         let cls: &[CItem] = cls;
-        sessions(&w.name, &w.evs, cls, ctx, &mut w.win, acc, uo);
+        sessions(&w.name, evs, cls, ctx, &mut w.win, acc, uo);
     }
 }

@@ -374,6 +374,9 @@ struct EvRec {
     _p: u32,
 }
 
+/// What empty dedup slots point at: an invalid copy, so scans need no emptiness test.
+static NO_EVENT: EvRec = EvRec { eid: EMPTY, user: 0, ing: u32::MAX, ts: u32::MAX, pc: 0, _p: 0 };
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PRec {
@@ -768,7 +771,7 @@ fn dedup_bucket(
     let cap = (n + n / 2).next_power_of_two();
     let mask = cap - 1;
     table.clear();
-    table.resize(cap, (EMPTY, std::ptr::null()));
+    table.resize(cap, (EMPTY, &NO_EVENT as *const EvRec));
 prof!(2, {
     for t in ev {
       let (v1, v2) = t.get(b);
@@ -798,6 +801,17 @@ prof!(2, {
 
 });prof!(3, {
     win.clear();
+    if fp.is_none() {
+        win.reserve(cap);
+        let w = win.as_mut_ptr();
+        let mut n = 0usize;
+        for s in table.iter() {
+            let r = unsafe { &*s.1 };
+            unsafe { w.add(n).write(PRec { pk: r.user, ts: r.ts, pc: r.pc }) };
+            n += (r.ts != u32::MAX) as usize;
+        }
+        unsafe { win.set_len(n) };
+    } else {
     for s in table.iter() {
         if s.0 == EMPTY {
             continue;
@@ -821,6 +835,7 @@ prof!(2, {
             }
         }
         win.push(PRec { pk: r.user, ts: r.ts, pc: r.pc });
+    }
     }
 
 });prof!(4, {

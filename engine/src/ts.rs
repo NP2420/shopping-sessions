@@ -377,7 +377,7 @@ impl Dates {
         let n = f.len();
         let p = f.as_ptr();
         if (n != 13 && n != 20) || (p as usize & 4095) > 4096 - 24 {
-            return match parse(f) {
+            return match self.parse(f) {
                 Some(v) => (true, v),
                 None => (false, 0),
             };

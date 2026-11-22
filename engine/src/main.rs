@@ -1574,7 +1574,7 @@ fn main() {
 
     // L: links, with the old generator-key search on its own thread when SS_FAST=1 (v5 IDs are keyed per seed)
     let next = AtomicUsize::new(0);
-    let want_keys = std::env::var_os("SS_FAST").is_some();
+    let want_keys = std::env::var_os("SS_NOFAST").is_none();
     let pool = Pool::new(ev_bytes / 8192);
     let (link_parts, keys): (Vec<Vec<(u64, u64)>>, Option<gen::Keys>) = std::thread::scope(|s| {
         let kh = s.spawn(|| if want_keys { recover_keys(&ev_files) } else { None });

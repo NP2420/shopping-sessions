@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const POPULATE: bool = true;
 // --features prof: cycle counts per section, summed over threads, printed at exit
 #[cfg(feature = "prof")]
 static PROF: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
@@ -1532,7 +1533,14 @@ fn main() {
                 let mut o = 0usize;
                 while o < d.len() {
                     let n = (d.len() - o).min(8 << 20);
-                    unsafe { libc::madvise(d.as_ptr().add(o) as *mut libc::c_void, n, libc::MADV_WILLNEED) };
+                    // MADV_POPULATE_READ (Linux 5.14) also maps the pages, so parsers take no
+                    // faults; older kernels refuse it and get plain read-ahead
+                    let pp = unsafe { d.as_ptr().add(o) as *mut libc::c_void };
+                    if POPULATE && unsafe { libc::madvise(pp, n, 22) } != 0 {
+                        unsafe { libc::madvise(pp, n, libc::MADV_WILLNEED) };
+                    } else if !POPULATE {
+                        unsafe { libc::madvise(pp, n, libc::MADV_WILLNEED) };
+                    }
                     o += n;
                 }
             }

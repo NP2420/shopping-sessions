@@ -233,52 +233,59 @@ pub fn mix(k: u64) -> u64 {
 }
 
 /// Bytes of overflow user IDs by key: an open-addressing table filled concurrently while the
-/// inputs are parsed and read only after. Key 0 marks a free slot (overflow keys have bit 63).
+/// inputs are parsed and read only after. Slots come in cache lines of four keys then their four
+/// values; a full line spills into the next. Key 0 marks a free slot (overflow keys have bit 63).
 /// The value packs the address with the length in the top 16 bits (all ones: the address is
-/// of a leaked slice). A key that finds no slot within `PROBES` goes to a locked side map.
+/// of a leaked slice). A key that finds no slot within `PROBES` lines goes to a locked side map.
 pub struct Pool {
-    slots: Vec<u64>, // [key, value] pairs, zeroed on allocation
-    mask: usize,
+    slots: Vec<u64>, // lines of [4 keys, 4 values], zeroed on allocation
+    mask: usize,     // line mask
     spill: Mutex<HashMap<u64, &'static [u8]>>,
 }
 
-const PROBES: usize = 64;
+const PROBES: usize = 16;
 
 impl Pool {
+    /// A table of about `want` slots (rounded up to a power of two).
     pub fn new(want: usize) -> Pool {
-        let cap = want.next_power_of_two().max(1 << 12);
-        Pool { slots: vec![0u64; 2 * cap], mask: cap - 1, spill: Mutex::new(HashMap::new()) }
+        let lines = (want / 4).next_power_of_two().max(1 << 10);
+        let mut slots: Vec<u64> = Vec::with_capacity(8 * lines + 8);
+        slots.resize(8 * lines + 8, 0);
+        // line-align the start so each line is one cache line
+        Pool { slots, mask: lines - 1, spill: Mutex::new(HashMap::new()) }
     }
     #[inline(always)]
-    fn at(&self, i: usize) -> (&AtomicU64, &AtomicU64) {
-        unsafe {
-            let p = self.slots.as_ptr().add(2 * i) as *const AtomicU64;
-            (&*p, &*p.add(1))
-        }
+    fn line(&self, i: usize) -> *const AtomicU64 {
+        let base = self.slots.as_ptr() as usize;
+        let al = (base + 63) & !63;
+        (al as *const u64).wrapping_add(8 * i) as *const AtomicU64
     }
     #[inline]
     pub fn insert(&self, k: u64, s: &'static [u8]) {
         let mut i = mix(k) as usize & self.mask;
         for _ in 0..PROBES {
-            let (ks, vs) = self.at(i);
-            let cur = ks.load(AO::Relaxed);
-            if cur == k {
-                return;
-            }
-            if cur == 0 {
-                match ks.compare_exchange(0, k, AO::Relaxed, AO::Relaxed) {
-                    Ok(_) => {
-                        let v = if s.len() < 0xFFFF {
-                            ((s.len() as u64) << 48) | s.as_ptr() as u64
-                        } else {
-                            let b: &'static &'static [u8] = Box::leak(Box::new(s));
-                            (0xFFFFu64 << 48) | (b as *const &'static [u8] as u64)
-                        };
-                        vs.store(v, AO::Relaxed);
-                        return;
+            let l = self.line(i);
+            for j in 0..4 {
+                let ks = unsafe { &*l.add(j) };
+                let cur = ks.load(AO::Relaxed);
+                if cur == k {
+                    return;
+                }
+                if cur == 0 {
+                    match ks.compare_exchange(0, k, AO::Relaxed, AO::Relaxed) {
+                        Ok(_) => {
+                            let v = if s.len() < 0xFFFF {
+                                ((s.len() as u64) << 48) | s.as_ptr() as u64
+                            } else {
+                                let b: &'static &'static [u8] = Box::leak(Box::new(s));
+                                (0xFFFFu64 << 48) | (b as *const &'static [u8] as u64)
+                            };
+                            unsafe { &*l.add(4 + j) }.store(v, AO::Relaxed);
+                            return;
+                        }
+                        Err(x) if x == k => return,
+                        Err(_) => {}
                     }
-                    Err(x) if x == k => return,
-                    Err(_) => {}
                 }
             }
             i = (i + 1) & self.mask;
@@ -288,22 +295,24 @@ impl Pool {
     pub fn get(&self, k: u64) -> Option<&'static [u8]> {
         let mut i = mix(k) as usize & self.mask;
         for _ in 0..PROBES {
-            let (ks, vs) = self.at(i);
-            let cur = ks.load(AO::Relaxed);
-            if cur == k {
-                let v = vs.load(AO::Relaxed);
-                let n = (v >> 48) as usize;
-                let p = (v & ((1u64 << 48) - 1)) as usize;
-                return Some(unsafe {
-                    if n == 0xFFFF {
-                        *(p as *const &'static [u8])
-                    } else {
-                        std::slice::from_raw_parts(p as *const u8, n)
-                    }
-                });
-            }
-            if cur == 0 {
-                return None;
+            let l = self.line(i);
+            for j in 0..4 {
+                let cur = unsafe { &*l.add(j) }.load(AO::Relaxed);
+                if cur == k {
+                    let v = unsafe { &*l.add(4 + j) }.load(AO::Relaxed);
+                    let n = (v >> 48) as usize;
+                    let p = (v & ((1u64 << 48) - 1)) as usize;
+                    return Some(unsafe {
+                        if n == 0xFFFF {
+                            *(p as *const &'static [u8])
+                        } else {
+                            std::slice::from_raw_parts(p as *const u8, n)
+                        }
+                    });
+                }
+                if cur == 0 {
+                    return None;
+                }
             }
             i = (i + 1) & self.mask;
         }

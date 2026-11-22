@@ -495,7 +495,7 @@ fn parse_events_g<const PUSH: bool>(
                 pok = true;
             }
         }
-        let late = (ing_ms != i64::MAX) & (ing_ms.wrapping_sub(t) > DAY);
+        let late = (ing_ms == i64::MAX) | (ing_ms.wrapping_sub(t) > DAY); // an unreadable ingest_ts (out of spec) counts as late
         let valid = !f[1].is_empty() & !f[5].is_empty() & tok & (t >= ws) & (t < we) & pok & !late;
         let (mut user, mut tsr, mut pc) = (0u64, u32::MAX, 0u32);
         if let Some(fa) = fa {
@@ -1306,7 +1306,8 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
     for _ in 0..reps {
     let t = std::time::Instant::now();
     lines = 0;
-    let o = Pool::new(1 << 20);
+    let o = Pool::new(std::env::var("SS_POOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20));
+    let mut dates = ts::Dates::new();
     let mut b = part::Parts::<EvRec>::new(512, 50_000);
     let mut fdummy = part::Parts::<fast::FRec>::new(1, 4);
     let fk = recover_keys(files).map(|k| fast::Fast::new(k, files.iter().map(|d| d.len()).sum()));
@@ -1330,17 +1331,21 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
                 lines += 1;
                 sum = sum.wrapping_add(f[2].len() as u64);
             }),
-            "ts" => scan::lines::<7>(d, 0, d.len(), |f| {
+            "ts" => scan::lines3::<7>(d, 0, d.len(), |f| {
                 lines += 1;
-                sum = sum.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64 ^ ts::parse(f[3]).unwrap_or(0) as u64);
+                sum = sum.wrapping_add(dates.window(f[2]).1 as u64 ^ dates.ingest(f[3]) as u64);
             }),
-            "ids" => scan::lines::<7>(d, 0, d.len(), |f| {
+            "win" => scan::lines3::<7>(d, 0, d.len(), |f| {
+                lines += 1;
+                sum = sum.wrapping_add(dates.window(f[2]).1 as u64);
+            }),
+            "ids" => scan::lines3::<7>(d, 0, d.len(), |f| {
                 lines += 1;
                 if !f[0].is_empty() && !f[1].is_empty() {
                     sum = sum.wrapping_add(ids::ident(f[0]) ^ ids::key(f[1], &o));
                 }
             }),
-            "prod" => scan::lines::<7>(d, 0, d.len(), |f| {
+            "prod" => scan::lines3::<7>(d, 0, d.len(), |f| {
                 lines += 1;
                 sum = sum.wrapping_add(ctx.cat_of(f[5]) as u64 + parse_price(f[6]).unwrap_or(0) as u64 + (f[4] == b"view") as u64);
             }),
@@ -1434,7 +1439,7 @@ fn main() {
     // L: links, with the old generator-key search on its own thread when SS_FAST=1 (v5 IDs are keyed per seed)
     let next = AtomicUsize::new(0);
     let want_keys = std::env::var_os("SS_FAST").is_some();
-    let pool = Pool::new(ev_bytes / 2048);
+    let pool = Pool::new(ev_bytes / 8192);
     let (link_parts, keys): (Vec<Vec<(u64, u64)>>, Option<gen::Keys>) = std::thread::scope(|s| {
         let kh = s.spawn(|| if want_keys { recover_keys(&ev_files) } else { None });
         let hs: Vec<_> = (0..nt)

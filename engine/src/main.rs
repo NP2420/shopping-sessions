@@ -423,7 +423,7 @@ fn parse_events_g<const PUSH: bool>(
     let ws = ctx.ws;
     let we = ctx.we;
     let mut dates = ts::Dates::new();
-    scan::lines::<7>(c.data, c.start, c.end, |f| {
+    scan::lines3::<7>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() {
             return;
         }
@@ -497,7 +497,7 @@ fn event_type(t: &[u8]) -> u32 {
 }
 
 fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
-    scan::lines::<2>(c.data, c.start, c.end, |f| {
+    scan::lines3::<2>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -513,7 +513,7 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, ovf: &mut Ovf, tmp: &mut Vec<CRec>, fa: Opt
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     let mut dates = ts::Dates::new();
-    scan::lines::<4>(c.data, c.start, c.end, |f| {
+    scan::lines3::<4>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -1189,6 +1189,10 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
                 }
                 lines += 1;
             }
+            "scan3" => scan::lines3::<7>(d, 0, d.len(), |f| {
+                lines += 1;
+                sum = sum.wrapping_add(f[2].len() as u64);
+            }),
             "ts" => scan::lines::<7>(d, 0, d.len(), |f| {
                 lines += 1;
                 sum = sum.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64 ^ ts::parse(f[3]).unwrap_or(0) as u64);

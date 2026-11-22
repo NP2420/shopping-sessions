@@ -153,3 +153,110 @@ pub fn lines<const N: usize>(d: &'static [u8], start: usize, end: usize, mut f: 
         }
     }
 }
+
+/// Variant of `lines`: a rolling window of three 64-byte blocks of masks; each line is cut with
+/// shifts and bit counts relative to its start, with no loop over separators. Lines longer than
+/// 128 bytes (rare) take a scalar path.
+#[inline(always)]
+pub fn lines3<const N: usize>(d: &'static [u8], start: usize, end: usize, mut f: impl FnMut(&mut [&'static [u8]; N])) {
+    let n = d.len();
+    let mut ls = if start == 0 {
+        memchr::memchr(b'\n', d).map_or(n, |i| i + 1)
+    } else {
+        memchr::memchr(b'\n', &d[start - 1..]).map_or(n, |i| start + i)
+    };
+    if ls >= end {
+        return;
+    }
+    // masks of the block at `at`; past the end of the data, a newline at n ends the last line
+    let blk = |at: usize| -> (u64, u64, u64) {
+        if at + 64 <= n {
+            masks(unsafe { &*(d.as_ptr().add(at) as *const [u8; 64]) })
+        } else if at <= n {
+            let rem = n - at;
+            let mut pad = [0u8; 64];
+            pad[..rem].copy_from_slice(&d[at..]);
+            let (a, b, c) = masks(&pad);
+            let v = if rem < 64 { 1u64 << rem } else { 0 };
+            (a | v, b, c)
+        } else {
+            (0, 0, 0)
+        }
+    };
+    let mut base = ls;
+    let (mut n0, mut c0, mut q0) = blk(base);
+    let (mut n1, mut c1, mut q1) = blk(base + 64);
+    let (mut n2, mut c2, mut q2) = blk(base + 128);
+    #[inline(always)]
+    fn win(a: u64, b: u64, c: u64, off: u32) -> u128 {
+        let lo = if off == 0 { a } else { (a >> off) | (b << (64 - off)) };
+        let hi = if off == 0 { b } else { (b >> off) | (c << (64 - off)) };
+        lo as u128 | ((hi as u128) << 64)
+    }
+    loop {
+        while ls - base >= 64 {
+            base += 64;
+            (n0, c0, q0) = (n1, c1, q1);
+            (n1, c1, q1) = (n2, c2, q2);
+            (n2, c2, q2) = blk(base + 128);
+        }
+        let off = (ls - base) as u32;
+        let nl = win(n0, n1, n2, off);
+        if nl == 0 {
+            // a line of 128 bytes or more: scalar
+            let le = memchr::memchr(b'\n', &d[ls..]).map_or(n, |i| ls + i);
+            let line = &d[ls..le];
+            let mut fl: [&'static [u8]; N] = [&[]; N];
+            let mut k = 0;
+            let mut a = ls;
+            let mut bad = false;
+            for (i, &ch) in line.iter().enumerate() {
+                if ch == b',' {
+                    if k == N - 1 {
+                        bad = true;
+                        break;
+                    }
+                    fl[k] = unsafe { d.get_unchecked(a..ls + i) };
+                    k += 1;
+                    a = ls + i + 1;
+                }
+            }
+            if !bad && k == N - 1 {
+                fl[N - 1] = unsafe { d.get_unchecked(a..le) };
+                let q = line.iter().filter(|&&ch| ch == b'"').count() as u32;
+                if q == 0 || unquote(&mut fl, q) {
+                    f(&mut fl);
+                }
+            }
+            ls = le + 1;
+            if ls >= end {
+                return;
+            }
+            continue;
+        }
+        let le = nl.trailing_zeros();
+        let below = (1u128 << le) - 1;
+        let mut cm = win(c0, c1, c2, off) & below;
+        if cm.count_ones() as usize == N - 1 {
+            let mut fl: [&'static [u8]; N] = [&[]; N];
+            let mut a = ls;
+            for k in 0..N - 1 {
+                let i = cm.trailing_zeros() as usize;
+                cm &= cm - 1;
+                fl[k] = unsafe { d.get_unchecked(a..ls + i) };
+                a = ls + i + 1;
+            }
+            let lend = ls + le as usize;
+            fl[N - 1] = unsafe { d.get_unchecked(a..lend.min(n)) };
+            let q = (win(q0, q1, q2, off) & below).count_ones();
+            let ok = q == 0 || if lend < n { unquote_inner(&mut fl, q) } else { unquote(&mut fl, q) };
+            if ok {
+                f(&mut fl);
+            }
+        }
+        ls += le as usize + 1;
+        if ls >= end {
+            return;
+        }
+    }
+}

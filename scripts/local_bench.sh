@@ -44,12 +44,12 @@ run() { # data-volume -> prints seconds (container StartedAt..FinishedAt) and le
     --cpus "$CPUS" --cpuset-cpus "${CPUSET:-0-7}" --memory "$MEM" --memory-swap "$MEM" --user 1000:1000 \
     -v "$1":/data:ro -v ss-out:/output -v ss-scratch:/scratch \
     -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-    -e NCPU="$CPUS" -e MEM_GB="${MEM%g}" $IMG)
+    -e NCPU="$CPUS" -e MEM_GB="${MEM%g}" ${VERBOSE:+-e SS_VERBOSE=1} $IMG)
   docker start -a "$cid" >/dev/null
   local code; code=$(docker inspect -f '{{.State.ExitCode}}' "$cid")
   local s f; s=$(docker inspect -f '{{.State.StartedAt}}' "$cid"); f=$(docker inspect -f '{{.State.FinishedAt}}' "$cid")
   docker rm "$cid" >/dev/null
-  echo "$(echo "$(date -d "$f" +%s.%N) - $(date -d "$s" +%s.%N)" | bc -l | cut -c1-6) s  exit=$code"
+  awk -v a="$(date -d "$s" +%s.%N)" -v b="$(date -d "$f" +%s.%N)" -v c="$code" 'BEGIN { printf "%.3f s  exit=%s\n", b - a, c }'
 }
 
 echo "== dev set correctness"
@@ -59,3 +59,5 @@ docker run --rm -v ss-out:/out:ro -v "$REPO/kit/dev-answer/dev-answer":/ans:ro -
 
 echo "== timing on seed $SEED, $EVENTS events ($RUNS runs)"
 for i in $(seq "$RUNS"); do run ss-p$SEED-$EVENTS; done
+echo "== phase timings (one verbose run)"
+VERBOSE=1 run ss-p$SEED-$EVENTS

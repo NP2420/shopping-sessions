@@ -1,6 +1,7 @@
 /target/
 **/target/
 /kit/
+/kit5/
 *.zip
 /dev/
 /data/

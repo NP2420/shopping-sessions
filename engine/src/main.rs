@@ -947,6 +947,7 @@ struct Work {
     csorted: Vec<CItem>,
     win: Win,
     name: Vec<u8>,
+    rtmp: Vec<u64>,
 }
 
 /// Click-window and category scratch for `sessions`.
@@ -994,6 +995,7 @@ impl Work {
             csorted: Vec::new(),
             win: Win::new(ncamp, ncat),
             name: Vec::new(),
+            rtmp: Vec::new(),
         }
     }
 }
@@ -1147,7 +1149,7 @@ prof!(7, {
 });    for p in 0..np {
         let (a, z) = (w.off[p] as usize, w.off[p + 1] as usize);
         let evs = &mut w.sorted[a..z];
-        prof!(9, evs.sort_unstable());
+        prof!(9, if evs.len() > 512 { radix_ts(evs, &mut w.rtmp) } else { evs.sort_unstable() });
         let (ca, cz) = (w.coff[p] as usize, w.coff[p + 1] as usize);
         let cls = &mut w.csorted[ca..cz];
         prof!(9, {
@@ -1167,6 +1169,41 @@ prof!(7, {
         ids::decode_into(w.pks[p], pool, &mut w.name);
         prof!(10, sessions(&w.name, evs, cls, ctx, &mut w.win, acc, uo));
     }
+}
+
+/// Sorts by the high 32 bits (the timestamp) only: events at one timestamp may come in any
+/// order. LSD radix, 11 + 11 + 10 bits.
+fn radix_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
+    let n = v.len();
+    tmp.clear();
+    tmp.resize(n, 0);
+    let mut c = [[0u32; 2048]; 3];
+    for &x in v.iter() {
+        let t = (x >> 32) as usize;
+        c[0][t & 2047] += 1;
+        c[1][(t >> 11) & 2047] += 1;
+        c[2][t >> 22] += 1;
+    }
+    for d in 0..3 {
+        let mut s = 0u32;
+        for k in 0..2048 {
+            let x = c[d][k];
+            c[d][k] = s;
+            s += x;
+        }
+    }
+    let (mut a, mut b): (&mut [u64], &mut [u64]) = (v, &mut tmp[..]);
+    for d in 0..3 {
+        let sh = 32 + 11 * d;
+        for &x in a.iter() {
+            let k = ((x >> sh) & 2047) as usize;
+            b[c[d][k] as usize] = x;
+            c[d][k] += 1;
+        }
+        std::mem::swap(&mut a, &mut b);
+    }
+    // three passes: the result is in `tmp`
+    b.copy_from_slice(a);
 }
 
 /// Sessions, attribution and aggregation for one person: `evs` holds (ts << 32 | price << 8 | cat)

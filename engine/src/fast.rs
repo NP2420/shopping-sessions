@@ -301,6 +301,9 @@ pub fn pass_a(
 /// After every bucket's pass A: each person's home bucket, or COMPLEX; and the click ranges.
 pub struct Plan {
     pub home: Vec<u32>,
+    /// click partition -> the bucket that sends its generic clicks while reading it (u32::MAX: a
+    /// separate pass does)
+    pub owner: Vec<u32>,
     /// the bucket's first run continues the last run of the previous non-empty bucket
     pub cont: Vec<bool>,
 }
@@ -339,7 +342,22 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
         env[b] = m;
     }
     let _ = (&env, m);
-    Plan { home, cont }
+    let mut owner = vec![u32::MAX; fast.ncb];
+    for b in 0..nib {
+        if let Some(ba) = a[b].get() {
+            for (ri, r) in ba.runs.iter().enumerate() {
+                if ri == 0 && cont[b] {
+                    continue;
+                }
+                let p = r.p as usize;
+                if !pt.complex(p) && home[p] == b as u32 {
+                    let cb = (r.p >> fast.cshift) as usize;
+                    owner[cb] = owner[cb].min(b as u32);
+                }
+            }
+        }
+    }
+    Plan { home, owner, cont }
 }
 
 pub struct BWork {
@@ -355,6 +373,9 @@ pub struct BWork {
 
 /// Clicks of persons not finished on the fast path go generic, one click partition per call.
 pub fn generic_clicks(cb: usize, fc: &[Parts<FClk>], fast: &Fast, pt: &PTab, plan: &Plan, links: &LinkTab, shift: u32, gen_cl: &mut Parts<CRec>) {
+    if plan.owner[cb] != u32::MAX {
+        return; // its owner bucket sends them
+    }
     for t in fc {
         let (x1, x2) = t.get(cb);
         for c in x1.iter().chain(x2) {
@@ -409,11 +430,16 @@ pub fn pass_b(
     w.cbs.dedup();
     w.cl.clear();
     for &cb in &w.cbs {
+        let own = plan.owner[cb as usize] == b as u32;
         for t in fc {
             let (x1, x2) = t.get(cb as usize);
             for c in x1.iter().chain(x2) {
                 if fin(c.p) {
                     w.cl.push((c.p, c.a, CItem { ts: c.ts, camp: c.camp, ck: c.ck }));
+                } else if own && (pt.complex(c.p as usize) || plan.home[c.p as usize] == u32::MAX) {
+                    let num = ((c.p as u64) << ALIAS_BITS) | c.a as u64;
+                    let pk = links.get(fast.user_key(num));
+                    gen_cl.push(bucket(pk, shift), CRec { pk, ck: c.ck, ts: c.ts, camp: c.camp, _p: 0 });
                 }
             }
         }

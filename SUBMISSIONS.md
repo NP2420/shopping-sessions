@@ -22,3 +22,4 @@ Scorer v5 (Nov 21 ~9 PM): board reset; 1 in 8 IDs now carry a 32-hex suffix and 
 | 13 | 6695c19 | 1.3105 s | correct | + clicks placed in person partitions during parsing, person table lines, radix for big persons. 0.2 s worse than #11: regression or a slow machine? |
 | 14 | 6695c19 | 1.1104 s | correct | same commit as #13: #13's 1.31 s was a slow machine (about 18% spread between two runs of one commit) |
 | 15 | 6063438 (branch exp-nothp) | 1.3184 s | correct | #14 without huge-page advice: slower, keep THP |
+| 16 | 1119b33 | 1.1057 s | correct | same engine as #14 (log-only commits on top): third sample, 1.10-1.11 s |

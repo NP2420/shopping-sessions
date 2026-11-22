@@ -569,30 +569,77 @@ fn resolve_clicks(tmp: &[CRec], links: &LinkTab, shift: u32, out: &mut part::Par
 
 // ---------------------------------------------------------------- linked IDs
 
+/// ID -> person name for every linked ID, in buckets of one cache line: four keys, then their
+/// four values. A lookup compares the four keys at once; a full bucket spills into the next one.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct LinkLine {
+    k: [u64; 4],
+    v: [u64; 4],
+}
+
 struct LinkTab {
-    pub slots: Vec<[u64; 2]>,
+    lines: Vec<LinkLine>,
     mask: usize,
 }
 
 impl LinkTab {
+    fn new(sl: &[[u64; 2]], n: usize) -> LinkTab {
+        let nb = (n * 10 / 24 + 1).next_power_of_two().max(4); // at most 60% full
+        let mask = nb - 1;
+        let mut lines = vec![LinkLine { k: [EMPTY; 4], v: [0; 4] }; nb];
+        for s in sl {
+            if s[0] == EMPTY {
+                continue;
+            }
+            let mut b = ids::mix(s[0]) as usize & mask;
+            'ins: loop {
+                for j in 0..4 {
+                    if lines[b].k[j] == EMPTY {
+                        lines[b].k[j] = s[0];
+                        lines[b].v[j] = s[1];
+                        break 'ins;
+                    }
+                }
+                b = (b + 1) & mask;
+            }
+        }
+        LinkTab { lines, mask }
+    }
     #[inline(always)]
     fn get(&self, k: u64) -> u64 {
-        let mut i = ids::mix(k) as usize & self.mask;
+        let mut b = ids::mix(k) as usize & self.mask;
         loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            if s[0] == k {
-                return s[1];
+            let l = unsafe { self.lines.get_unchecked(b) };
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            let (eq, em) = unsafe {
+                use std::arch::x86_64::*;
+                let kv = _mm256_load_si256(l.k.as_ptr() as *const __m256i);
+                let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, _mm256_set1_epi64x(k as i64)))) as u32;
+                let em = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, _mm256_set1_epi64x(EMPTY as i64)))) as u32;
+                (eq, em)
+            };
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            let (eq, em) = {
+                let (mut eq, mut em) = (0u32, 0u32);
+                for j in 0..4 {
+                    eq |= ((l.k[j] == k) as u32) << j;
+                    em |= ((l.k[j] == EMPTY) as u32) << j;
+                }
+                (eq, em)
+            };
+            let cand = l.v[((eq | 16).trailing_zeros() & 3) as usize];
+            let r = std::hint::select_unpredictable(eq != 0, cand, k);
+            if (eq | em) != 0 {
+                return r;
             }
-            if s[0] == EMPTY {
-                return k;
-            }
-            i = (i + 1) & self.mask;
+            b = (b + 1) & self.mask;
         }
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
-        let i = ids::mix(k) as usize & self.mask;
-        prefetch(unsafe { self.slots.as_ptr().add(i) } as *const u8);
+        let b = ids::mix(k) as usize & self.mask;
+        prefetch(unsafe { self.lines.as_ptr().add(b) } as *const u8);
     }
 }
 
@@ -697,7 +744,7 @@ fn try_links(edges: &[Vec<(u64, u64)>], pool: &Pool, cap: usize, fa: Option<&fas
             sl[i][1] = sl[r][0];
         }
     }
-    Some((LinkTab { slots: sl, mask }, pt))
+    Some((LinkTab::new(&sl, used), pt))
 }
 
 // ---------------------------------------------------------------- dedup

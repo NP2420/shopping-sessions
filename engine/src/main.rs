@@ -921,8 +921,21 @@ struct UserOut {
     topv: pq::Bytes,
 }
 
+/// Person slots, a cache line of four: person keys, then their local ids.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct PLine {
+    k: [u64; 4],
+    l: [u32; 4],
+    _pad: [u32; 4],
+}
+
+impl PLine {
+    const EMPTY: PLine = PLine { k: [EMPTY; 4], l: [0; 4], _pad: [0; 4] };
+}
+
 struct Work {
-    tab: Vec<(u64, u32)>,
+    tab: Vec<PLine>,
     lids: Vec<u32>,
     cnt: Vec<u32>,
     off: Vec<u32>,
@@ -999,11 +1012,11 @@ fn person_bucket(
     if nev == 0 {
         return;
     }
-    // people per bucket are far fewer than events: start small and grow at half load
-    let mut cap = (nev / 8).next_power_of_two().max(64);
-    let mut mask = cap - 1;
+    // people per bucket are far fewer than events: start at a guess and grow at 3/4 load
+    let mut nl = (nev / 12).next_power_of_two().max(16);
+    let mut mask = nl - 1;
     w.tab.clear();
-    w.tab.resize(cap, (EMPTY, 0));
+    w.tab.resize(nl, PLine::EMPTY);
     w.lids.clear();
     w.cnt.clear();
     w.pks.clear();
@@ -1013,29 +1026,38 @@ prof!(6, {
         for r in x1.iter().chain(x2) {
             let mut i = ids::mix(r.pk) as usize & mask;
             let lid = loop {
-                let s = unsafe { w.tab.get_unchecked_mut(i) };
-                if s.0 == r.pk {
-                    break s.1;
+                let l = unsafe { w.tab.get_unchecked_mut(i) };
+                let (eq, em) = find4(&l.k, r.pk);
+                if eq != 0 {
+                    break l.l[eq.trailing_zeros() as usize];
                 }
-                if s.0 == EMPTY {
-                    let l = w.pks.len() as u32;
-                    *s = (r.pk, l);
+                if em != 0 {
+                    let id = w.pks.len() as u32;
+                    let j = em.trailing_zeros() as usize;
+                    l.k[j] = r.pk;
+                    l.l[j] = id;
                     w.pks.push(r.pk);
                     w.cnt.push(0);
-                    if w.pks.len() * 2 > cap {
-                        cap *= 2;
-                        mask = cap - 1;
+                    if w.pks.len() > nl * 3 {
+                        nl *= 2;
+                        mask = nl - 1;
                         w.tab.clear();
-                        w.tab.resize(cap, (EMPTY, 0));
+                        w.tab.resize(nl, PLine::EMPTY);
                         for (l2, &k) in w.pks.iter().enumerate() {
                             let mut j = ids::mix(k) as usize & mask;
-                            while w.tab[j].0 != EMPTY {
+                            loop {
+                                let (_, em) = find4(&w.tab[j].k, k);
+                                if em != 0 {
+                                    let q = em.trailing_zeros() as usize;
+                                    w.tab[j].k[q] = k;
+                                    w.tab[j].l[q] = l2 as u32;
+                                    break;
+                                }
                                 j = (j + 1) & mask;
                             }
-                            w.tab[j] = (k, l2 as u32);
                         }
                     }
-                    break l;
+                    break id;
                 }
                 i = (i + 1) & mask;
             };
@@ -1080,11 +1102,12 @@ prof!(7, {
         for c in x1.iter().chain(x2) {
             let mut i = ids::mix(c.pk) as usize & mask;
             let lid = loop {
-                let s = unsafe { w.tab.get_unchecked(i) };
-                if s.0 == c.pk {
-                    break s.1;
+                let l = unsafe { w.tab.get_unchecked(i) };
+                let (eq, em) = find4(&l.k, c.pk);
+                if eq != 0 {
+                    break l.l[eq.trailing_zeros() as usize];
                 }
-                if s.0 == EMPTY {
+                if em != 0 {
                     break u32::MAX;
                 }
                 i = (i + 1) & mask;

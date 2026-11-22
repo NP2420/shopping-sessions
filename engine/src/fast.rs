@@ -103,9 +103,11 @@ impl Fast {
 }
 
 pub const COMPLEX: u8 = 1;
+pub const LINKED: u8 = 2;
 
 /// Per-person facts from the links.
 pub struct PTab {
+    pub wide: std::collections::HashMap<u32, Box<[u64; 8]>>, // linked aliases 64..512, rare
     pub lmask: Vec<u64>, // linked aliases (alias < 64)
     pub lname: Vec<u64>, // the component's name, if linked
     pub flags: Vec<AtomicU8>,
@@ -122,12 +124,20 @@ impl PTab {
             self.flags[p].fetch_or(COMPLEX, Ordering::Relaxed);
         }
     }
+    #[inline(always)]
+    pub fn linked(&self, p: usize) -> bool {
+        self.flags[p].load(Ordering::Relaxed) & LINKED != 0
+    }
     /// Whether events and clicks by alias `a` stay inside the person's own component.
     #[inline(always)]
     pub fn alias_ok(&self, p: usize, a: u32) -> bool {
         let m = self.lmask[p];
-        if m != 0 {
-            a < 64 && (m >> a) & 1 != 0
+        if self.linked(p) {
+            if a < 64 {
+                (m >> a) & 1 != 0
+            } else {
+                self.wide.get(&(p as u32)).map_or(false, |w| (w[(a >> 6) as usize] >> (a & 63)) & 1 != 0)
+            }
         } else {
             a == 0
         }
@@ -145,6 +155,7 @@ pub fn ptab_from_roots(sl: &[[u64; 2]], pool: &Pool, fast: &Fast) -> PTab {
     const NONE: u32 = u32::MAX - 1;
     const MIXED: u32 = u32::MAX;
     let mut owner = vec![NONE; sl.len()];
+    let mut wide: std::collections::HashMap<u32, Box<[u64; 8]>> = std::collections::HashMap::new();
     let mut num = vec![u64::MAX; sl.len()];
     let mut buf = Vec::with_capacity(16);
     for (i, s) in sl.iter().enumerate() {
@@ -179,15 +190,19 @@ pub fn ptab_from_roots(sl: &[[u64; 2]], pool: &Pool, fast: &Fast) -> PTab {
         let a = (n & ((1 << ALIAS_BITS) - 1)) as u32;
         let r = s[1] as usize;
         let name = sl[r][0];
-        if a >= 64 || owner[r] != p as u32 || (lmask[p] != 0 && lname[p] != name) {
-            flags[p].store(COMPLEX, Ordering::Relaxed);
+        if owner[r] != p as u32 || (flags[p].load(Ordering::Relaxed) & LINKED != 0 && lname[p] != name) {
+            flags[p].fetch_or(COMPLEX, Ordering::Relaxed);
         }
+        flags[p].fetch_or(LINKED, Ordering::Relaxed);
         if a < 64 {
             lmask[p] |= 1 << a;
+        } else {
+            let wbits = wide.entry(p as u32).or_insert_with(|| Box::new([0u64; 8]));
+            wbits[(a >> 6) as usize] |= 1 << (a & 63);
         }
         lname[p] = name;
     }
-    PTab { lmask, lname, flags }
+    PTab { wide, lmask, lname, flags }
 }
 
 /// One bucket's winners in index order, as runs of one person each.
@@ -272,6 +287,8 @@ pub fn pass_a(
 /// After every bucket's pass A: each person's home bucket, or COMPLEX; and the click ranges.
 pub struct Plan {
     pub home: Vec<u32>,
+    /// the bucket's first run continues the last run of the previous non-empty bucket
+    pub cont: Vec<bool>,
     pub lo: Vec<u32>, // click person range per bucket, inclusive
     pub hi: Vec<u32>,
 }
@@ -280,15 +297,30 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
     let mut home = vec![u32::MAX; fast.np];
     let nib = a.len();
     let mut env = vec![0u32; nib];
+    let mut cont = vec![false; nib];
     let mut m = 0u32;
+    // last run of the latest non-empty bucket: (person, last ts)
+    let mut prev: Option<(u32, u32)> = None;
     for b in 0..nib {
         if let Some(ba) = a[b].get() {
-            for r in &ba.runs {
+            for (ri, r) in ba.runs.iter().enumerate() {
                 let p = r.p as usize;
+                let first_ts = ba.w[r.start as usize].0;
+                if ri == 0 && matches!(prev, Some((pp, pts)) if pp == r.p && pts <= first_ts) {
+                    // the same person's events go on in this bucket
+                    cont[b] = true;
+                    if !r.ok {
+                        pt.set_complex(p);
+                    }
+                    continue;
+                }
                 if !r.ok || home[p] != u32::MAX {
                     pt.set_complex(p);
                 }
                 home[p] = b as u32;
+            }
+            if let Some(r) = ba.runs.last() {
+                prev = Some((r.p, ba.w[(r.start + r.len - 1) as usize].0));
             }
             m = m.max(ba.maxp);
         }
@@ -299,21 +331,21 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
     for b in 0..nib {
         lo[b] = if b == 0 { 0 } else { env[b - 1] + 1 };
         hi[b] = if b + 1 == nib { fast.np as u32 - 1 } else { env[b] };
-        if b > 0 && env[b - 1] == env[b] && b + 1 != nib {
-            // empty range: lo > hi
-        }
     }
     // a person's clicks must be handled by its home bucket
     for b in 0..nib {
         if let Some(ba) = a[b].get() {
-            for r in &ba.runs {
+            for (ri, r) in ba.runs.iter().enumerate() {
+                if ri == 0 && cont[b] {
+                    continue;
+                }
                 if r.p < lo[b] || r.p > hi[b] {
                     pt.set_complex(r.p as usize);
                 }
             }
         }
     }
-    Plan { home, lo, hi }
+    Plan { home, cont, lo, hi }
 }
 
 pub struct BWork {
@@ -329,8 +361,9 @@ pub struct BWork {
 #[allow(clippy::too_many_arguments)]
 pub fn pass_b(
     b: usize,
-    ba: &BucketA,
+    all: &[std::sync::OnceLock<BucketA>],
     fc: &[Parts<FClk>],
+    extras: &[(u32, u32, u32, u32)],
     fast: &Fast,
     pt: &PTab,
     plan: &Plan,
@@ -344,6 +377,8 @@ pub fn pass_b(
     gen_ev: &mut Parts<PRec>,
     gen_cl: &mut Parts<CRec>,
 ) {
+    let empty = BucketA::default();
+    let ba = all[b].get().unwrap_or(&empty);
     let (lo, hi) = (plan.lo[b], plan.hi[b]);
     // clicks of persons in [lo, hi]
     w.cl.clear();
@@ -387,10 +422,12 @@ pub fn pass_b(
             pos[k] += 1;
         }
     }
-    for r in &ba.runs {
+    let nruns = ba.runs.len();
+    for (ri, r) in ba.runs.iter().enumerate() {
         let p = r.p as usize;
         let run = &ba.w[r.start as usize..(r.start + r.len) as usize];
-        if pt.complex(p) || plan.home[p] != b as u32 || r.p < lo || r.p > hi {
+        let is_cont = ri == 0 && plan.cont[b];
+        if pt.complex(p) || (!is_cont && (plan.home[p] != b as u32 || r.p < lo || r.p > hi)) {
             for &(ts, pc, a) in run {
                 let num = ((p as u64) << ALIAS_BITS) | a as u64;
                 let pk = links.get(fast.user_key(num));
@@ -398,8 +435,39 @@ pub fn pass_b(
             }
             continue;
         }
+        if is_cont {
+            continue; // finished by the bucket where the run starts
+        }
         w.evs.clear();
         w.evs.extend(run.iter().map(|&(ts, pc, _)| ((ts as u64) << 32) | pc as u64));
+        if ri + 1 == nruns {
+            // the run may go on in the following buckets
+            let mut nb = b + 1;
+            while nb < all.len() {
+                match all[nb].get() {
+                    None => nb += 1,
+                    Some(nx) if nx.runs.is_empty() => nb += 1,
+                    Some(nx) => {
+                        if !plan.cont[nb] {
+                            break;
+                        }
+                        let r2 = nx.runs[0];
+                        w.evs.extend(nx.w[r2.start as usize..(r2.start + r2.len) as usize].iter().map(|&(ts, pc, _)| ((ts as u64) << 32) | pc as u64));
+                        if nx.runs.len() > 1 {
+                            break;
+                        }
+                        nb += 1;
+                    }
+                }
+            }
+        }
+        // events of this person that took the generic dedup route
+        let xa = extras.partition_point(|x| x.0 < r.p);
+        let xz = extras.partition_point(|x| x.0 <= r.p);
+        if xa < xz {
+            w.evs.extend(extras[xa..xz].iter().map(|x| ((x.2 as u64) << 32) | x.3 as u64));
+            w.evs.sort_unstable();
+        }
         let k = (r.p - lo) as usize;
         let cls = &mut w.cs[w.ccnt[k] as usize..w.ccnt[k + 1] as usize];
         if cls.len() > 1 {
@@ -414,7 +482,7 @@ pub fn pass_b(
             });
         }
         w.name.clear();
-        if pt.lmask[p] != 0 {
+        if pt.linked(p) {
             ids::decode_into(pt.lname[p], pool, &mut w.name);
         } else {
             fast.user_string((p as u64) << ALIAS_BITS, &mut w.name);

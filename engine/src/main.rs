@@ -668,6 +668,7 @@ fn dedup_bucket(
     out: &mut part::Parts<PRec>,
     fp: Option<(&fast::Fast, &fast::PTab)>,
     pool: &Pool,
+    extras: &mut Vec<(u32, u32, u32, u32)>,
 ) {
     let n: usize = ev.iter().map(|t| t.len(b)).sum();
     if n == 0 {
@@ -711,15 +712,21 @@ fn dedup_bucket(
         if r.ts == u32::MAX {
             continue;
         }
-        win.push(PRec { pk: r.user, ts: r.ts, pc: r.pc });
         if let Some((fa, pt)) = fp {
-            // a person that has any event on this route cannot be finished on the fast path
+            // an event of a dense person on this route joins that person's run later
             let mut sb = Vec::new();
             ids::decode_into(r.user, pool, &mut sb);
             if let Some(n) = fa.user_number(&sb) {
-                pt.set_complex((n >> gen::ALIAS_BITS) as usize);
+                let p = (n >> gen::ALIAS_BITS) as u32;
+                let a = (n & ((1 << gen::ALIAS_BITS) - 1)) as u32;
+                if !pt.alias_ok(p as usize, a) {
+                    pt.set_complex(p as usize);
+                }
+                extras.push((p, a, r.ts, r.pc));
+                continue;
             }
         }
+        win.push(PRec { pk: r.user, ts: r.ts, pc: r.pc });
     }
     const D: usize = 16;
     for i in 0..win.len() {
@@ -1337,7 +1344,7 @@ fn main() {
     let ncb = fa.map_or(1, |f| f.ncb);
     let fcper = fa.map_or(4, |f| cl_bytes / 48 / nt / f.ncb * 3 / 2 + 64);
     let bucket_a: Vec<std::sync::OnceLock<fast::BucketA>> = (0..nib).map(|_| std::sync::OnceLock::new()).collect();
-    let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, part::Parts<fast::FClk>, Ovf)> = std::thread::scope(|s| {
+    let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, part::Parts<fast::FClk>, Ovf, Vec<(u32, u32, u32, u32)>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
@@ -1349,6 +1356,7 @@ fn main() {
                     let mut win = Vec::new();
                     let mut tmp = Vec::new();
                     let mut slots = Vec::new();
+                    let mut ex = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= ntasks {
@@ -1357,7 +1365,7 @@ fn main() {
                         if i < cl_chunks.len() {
                             parse_clicks(cl_chunks[i], &ctx, &links, shift, &mut pc, &mut o, &mut tmp, fp, &mut fc);
                         } else if i < cl_chunks.len() + nb {
-                            dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut win, &mut pe, fp, &pool);
+                            dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut win, &mut pe, fp, &pool, &mut ex);
                         } else {
                             let b = i - cl_chunks.len() - nb;
                             let (f, pt) = fp.unwrap();
@@ -1368,24 +1376,27 @@ fn main() {
                     pe.finish();
                     pc.finish();
                     fc.finish();
-                    (pe, pc, fc, o)
+                    (pe, pc, fc, o, ex)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     lap("dedup + clicks + pass A");
-    for (_, _, _, o) in &d_parts {
+    for (_, _, _, o, _) in &d_parts {
         pool.extend(o.iter().copied());
     }
-    let mut pev = Vec::with_capacity(2 * nt);
+    let mut pev = Vec::with_capacity(2 * nt + 1);
     let mut pcl = Vec::with_capacity(2 * nt);
     let mut fcl = Vec::with_capacity(nt);
-    for (a, b, c, _) in d_parts {
+    let mut extras: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for (a, b, c, _, x) in d_parts {
         pev.push(a);
         pcl.push(b);
         fcl.push(c);
+        extras.extend(x);
     }
+    extras.sort_unstable();
     let _ = ishift;
 
     let ud = out.join("user_daily");
@@ -1398,6 +1409,20 @@ fn main() {
     let mut outs: Vec<(UserOut, Acc)> = Vec::with_capacity(nt);
     if let Some((f, pt)) = fp {
         let plan = fast::classify(&bucket_a, f, pt);
+        // extras of persons not finished on the fast path go generic
+        let mut gx = part::Parts::<PRec>::new(nb, 16);
+        extras.retain(|&(p, a, ts, pc)| {
+            if pt.complex(p as usize) || plan.home[p as usize] == u32::MAX {
+                let pk = links.get(f.user_key(((p as u64) << gen::ALIAS_BITS) | a as u64));
+                gx.push(bucket(pk, shift), PRec { pk, ts, pc });
+                false
+            } else {
+                true
+            }
+        });
+        gx.finish();
+        pev.push(gx);
+        let extras = &extras;
         lap("classified");
         let next = AtomicUsize::new(0);
         let b_parts: Vec<(UserOut, Acc, part::Parts<PRec>, part::Parts<CRec>)> = std::thread::scope(|s| {
@@ -1410,14 +1435,12 @@ fn main() {
                         let mut ge = part::Parts::<PRec>::new(nb, 64);
                         let mut gc = part::Parts::<CRec>::new(nb, 32);
                         let mut w = fast::BWork { cl: Vec::new(), ccnt: Vec::new(), cs: Vec::new(), evs: Vec::new(), name: Vec::new(), win: Win::new(ncamp, ctx.cats.len()) };
-                        let empty = fast::BucketA::default();
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             if i >= nib {
                                 break;
                             }
-                            let ba = bucket_a[i].get().unwrap_or(&empty);
-                            fast::pass_b(i, ba, fcl, f, pt, plan, links, pool, ctx, shift, &mut w, &mut acc, &mut uo, &mut ge, &mut gc);
+                            fast::pass_b(i, bucket_a, fcl, extras, f, pt, plan, links, pool, ctx, shift, &mut w, &mut acc, &mut uo, &mut ge, &mut gc);
                         }
                         ge.finish();
                         gc.finish();

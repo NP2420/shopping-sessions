@@ -233,6 +233,7 @@ unsafe fn ldp(p: *const u8, i: usize) -> u64 {
 /// anything unusual on the exact path. Returns (ok, ms). Years outside the calendar table come
 /// back as not ok, which callers treat like any timestamp outside the window.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn parse_window(f: &[u8]) -> (bool, i64) {
     let n = f.len();
     let p = f.as_ptr();
@@ -278,6 +279,139 @@ pub fn parse_window(f: &[u8]) -> (bool, i64) {
     }
 }
 
+
+/// Direct-mapped cache of validated dates: the exact 10 bytes `YYYY-MM-DD` to the day's epoch ms.
+pub struct Dates {
+    k1: [u64; 64],
+    k2: [u16; 64],
+    v: [i64; 64],
+}
+
+impl Dates {
+    pub fn new() -> Self {
+        Dates { k1: [u64::MAX; 64], k2: [0; 64], v: [0; 64] }
+    }
+
+    /// Epoch ms of the date in bytes 0..10 (`p` must have 10 readable bytes), or None.
+    #[inline(always)]
+    unsafe fn day(&mut self, p: *const u8) -> Option<i64> {
+        let k1 = ldp(p, 0);
+        let k2 = std::ptr::read_unaligned(p.add(8) as *const u16);
+        let h = ((k1 ^ ((k2 as u64) << 21)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+        if *self.k1.get_unchecked(h) == k1 && *self.k2.get_unchecked(h) == k2 {
+            return Some(*self.v.get_unchecked(h));
+        }
+        self.day_miss(p, k1, k2, h)
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn day_miss(&mut self, p: *const u8, k1: u64, k2: u16, h: usize) -> Option<i64> {
+        let f = std::slice::from_raw_parts(p, 10);
+        if f[4] != b'-' || f[7] != b'-' {
+            return None;
+        }
+        let y = d2(f, 0)? * 100 + d2(f, 2)?;
+        let mo = d2(f, 5)?;
+        let d = d2(f, 8)?;
+        if mo < 1 || mo > 12 || d < 1 || d > month_days(y, mo) {
+            return None;
+        }
+        let v = days_from_civil(y, mo, d) * DAY_MS;
+        self.k1[h] = k1;
+        self.k2[h] = k2;
+        self.v[h] = v;
+        Some(v)
+    }
+
+    /// `THH:MM:SS` at bytes 10..19 to ms within the day, or None.
+    #[inline(always)]
+    unsafe fn time(p: *const u8) -> Option<i64> {
+        let c = ldp(p, 11);
+        const SC: u64 = 0x0000_FF00_00FF_0000;
+        if *p.add(10) != b'T' || c & SC != 0x0000_3A00_003A_0000 || !swar_all_digits(c, !SC) {
+            return None;
+        }
+        let d = |i: u32| -> i64 { ((c >> (8 * i)) & 0xF) as i64 };
+        let h = d(0) * 10 + d(1);
+        let mi = d(3) * 10 + d(4);
+        let s = d(6) * 10 + d(7);
+        if h > 23 || mi > 59 || s > 59 {
+            return None;
+        }
+        Some((h * 3600 + mi * 60 + s) * 1000)
+    }
+
+    /// Same result as `parse` for any input.
+    #[inline(always)]
+    pub fn parse(&mut self, f: &[u8]) -> Option<i64> {
+        let n = f.len();
+        let p = f.as_ptr();
+        if (n == 20 || n == 25) && (p as usize & 4095) <= 4096 - 24 {
+            unsafe {
+                if n == 20 {
+                    if *p.add(19) != b'Z' {
+                        return parse_slow(f);
+                    }
+                    return Some(self.day(p)? + Self::time(p)?);
+                }
+                let sg = *p.add(19);
+                if (sg == b'+' || sg == b'-') && *p.add(22) == b':' {
+                    let base = self.day(p)? + Self::time(p)?;
+                    let oh = d2(f, 20)?;
+                    let om = d2(f, 23)?;
+                    if oh > 23 || om > 59 {
+                        return None;
+                    }
+                    let off = (oh * 60 + om) * 60_000;
+                    return Some(if sg == b'+' { base - off } else { base + off });
+                }
+                return parse_slow(f);
+            }
+        }
+        parse(f)
+    }
+    /// Like `parse_window`, with dates from the cache.
+    #[inline(always)]
+    pub fn window(&mut self, f: &[u8]) -> (bool, i64) {
+        let n = f.len();
+        let p = f.as_ptr();
+        if (n != 13 && n != 20) || (p as usize & 4095) > 4096 - 24 {
+            return match parse(f) {
+                Some(v) => (true, v),
+                None => (false, 0),
+            };
+        }
+        unsafe {
+            let a = ldp(p, 0);
+            let a5 = ldp(p, 5);
+            let f3_ok = (n == 13) & swar_all_digits(a, !0) & swar_all_digits(a5, !0);
+            let f3 = (swar8(a) * 100_000 + swar8((a5 >> 24) << 24 | 0x0030_3030)) as i64;
+            let k2 = std::ptr::read_unaligned(p.add(8) as *const u16);
+            let h = ((a ^ ((k2 as u64) << 21)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+            let hit = (*self.k1.get_unchecked(h) == a) & (*self.k2.get_unchecked(h) == k2);
+            let is20 = (n == 20) & (*p.add(19) == b'Z');
+            if is20 & !hit {
+                return match self.parse(f) {
+                    Some(v) => (true, v),
+                    None => (false, 0),
+                };
+            }
+            let c = ldp(p, 11);
+            const SC: u64 = 0x0000_FF00_00FF_0000;
+            let d = |i: u32| -> i64 { ((c >> (8 * i)) & 0xF) as i64 };
+            let hh = d(0) * 10 + d(1);
+            let mi = d(3) * 10 + d(4);
+            let ss = d(6) * 10 + d(7);
+            let tok = (*p.add(10) == b'T') & (c & SC == 0x0000_3A00_003A_0000) & swar_all_digits(c, !SC) & (hh <= 23) & (mi <= 59) & (ss <= 59);
+            let f1 = *self.v.get_unchecked(h) + (hh * 3600 + mi * 60 + ss) * 1000;
+            let f1_ok = is20 & hit & tok;
+            let v = if f3_ok { f3 } else { f1 };
+            (f3_ok | f1_ok, v)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +444,7 @@ mod tests {
             x
         };
         let alphabet = b"0123456789-T:Z+ zt.";
+        let mut dates = Dates::new();
         let templates: [&[u8]; 6] = [b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"1791071890000", b"2026-10-03T19:58:10-04:00", b"0000000000000", b"9999-12-31T23:59:59+23:59"];
         for _ in 0..2_000_000 {
             let t = templates[(rnd() % 6) as usize];
@@ -321,9 +456,17 @@ mod tests {
                 v[i] = if r % 3 == 0 { alphabet[(r as usize / 3) % alphabet.len()] } else { b'0' + ((r >> 8) % 10) as u8 };
             }
             assert_eq!(parse(&v), parse_slow(&v), "{}", String::from_utf8_lossy(&v));
+            let mut pv = v.clone();
+            pv.extend_from_slice(b"..........");
+            assert_eq!(dates.parse(&pv[..v.len()]), parse_slow(&v), "dates {}", String::from_utf8_lossy(&v));
             let mut padded = v.clone();
             padded.extend_from_slice(b",2026-10-03T23:58:10Z,xxxxxxxx");
             let (ok, w) = parse_window(&padded[..v.len()]);
+            let (ok2, w2) = dates.window(&padded[..v.len()]);
+            assert_eq!(ok2, parse_slow(&v).is_some(), "window {}", String::from_utf8_lossy(&v));
+            if ok2 {
+                assert_eq!(Some(w2), parse_slow(&v));
+            }
             let exact = parse_slow(&v);
             if ok {
                 assert_eq!(Some(w), exact, "{}", String::from_utf8_lossy(&v));

@@ -388,13 +388,14 @@ fn parse_events_g<const PUSH: bool>(
 ) {
     let ws = ctx.ws;
     let we = ctx.we;
+    let mut dates = ts::Dates::new();
     scan::lines::<7>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() {
             return;
         }
-        let ing_ms = ts::parse(f[3]).unwrap_or(i64::MAX);
+        let ing_ms = dates.parse(f[3]).unwrap_or(i64::MAX);
         let ing = if ing_ms >= 0 && ing_ms / 1000 < u32::MAX as i64 { (ing_ms / 1000) as u32 } else { u32::MAX };
-        let (tok, t) = ts::parse_window(f[2]);
+        let (tok, t) = dates.window(f[2]);
         let ty = event_type(f[4]); // 0 bad, 1 view/cart, 2 purchase
         let mut price = 0u32;
         let mut pok = ty == 1;
@@ -487,6 +488,7 @@ fn parse_clicks(
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     tmp.clear();
+    let mut dates = ts::Dates::new();
     scan::lines::<4>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -495,7 +497,7 @@ fn parse_clicks(
             Some(x) => x,
             None => return,
         };
-        let (tok, t) = ts::parse_window(f[3]);
+        let (tok, t) = dates.window(f[3]);
         if !(tok & (t >= lo) & (t < hi)) {
             return;
         }

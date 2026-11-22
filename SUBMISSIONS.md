@@ -9,3 +9,4 @@
 | 5 | 1fa4834 | 0.9364 s | correct | + runs across buckets, wide aliases, extras (generic events 11% -> 1.3%), clicks parsed in event phase, stale-slot pass A, small assist array |
 | 6 | 763eb19 | 0.8993 s | correct | + SWAR product ids, key search overlapped with links (smaller sample), lean ingest parse, pre-reserved buffers |
 | 7 | f801706 | 0.8762 s | correct | + 24-byte fast records (no padding; write-combining for any record size) |
+| 8 | b4cae74 | 0.8409 s | correct | + 8-byte pass-A winners with alias exceptions (runs read in place), forward extras walk, finished-person bitmap, unquote w/o empty test, SWAR time of day |

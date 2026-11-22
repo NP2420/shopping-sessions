@@ -1829,6 +1829,19 @@ fn main() {
         let _ = h.join();
     }
     lap("background writes done");
+    // experiment: 80 MB of extra (ignored) output, to see whether output size costs time after exit
+    {
+        let mut f = std::fs::File::create(out.join("user_daily").join("junk.bin")).unwrap();
+        let mut left = 80usize << 20;
+        for d in ev_files.iter() {
+            let n = d.len().min(left);
+            let _ = std::io::Write::write_all(&mut f, &d[..n]);
+            left -= n;
+            if left == 0 {
+                break;
+            }
+        }
+    }
     #[cfg(feature = "prof")]
     {
         let ghz = 1e-6 * {

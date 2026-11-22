@@ -173,6 +173,33 @@ fn canon_num(s: &[u8], prefix: &[u8]) -> Option<usize> {
     Some(v)
 }
 
+/// `canon_num(s, b"p")` for 2..=9 bytes in one 8-byte load; None means "use the general path"
+/// (also for inputs the general path would accept, such as at a page end).
+#[inline(always)]
+fn canon_p_fast(s: &[u8]) -> Option<usize> {
+    let n = s.len();
+    let ptr = s.as_ptr();
+    if n < 2 || n > 9 || (ptr as usize & 4095) > 4096 - 9 || s[0] != b'p' || s[1] == b'0' {
+        return None;
+    }
+    let m = n - 1; // digits
+    let w = unsafe { std::ptr::read_unaligned(ptr.add(1) as *const u64) };
+    // keep the m digit bytes, left-pad with '0' so they sit at the top of an 8-digit number
+    let sh = 8 * (8 - m) as u32;
+    let x = if m == 8 { w } else { (w << sh) | (0x3030_3030_3030_3030u64 >> (64 - sh)) };
+    let hi = x & 0xF0F0_F0F0_F0F0_F0F0;
+    let lo = (x & 0x0F0F_0F0F_0F0F_0F0F).wrapping_add(0x0606_0606_0606_0606);
+    if hi != 0x3030_3030_3030_3030 || lo & 0xF0F0_F0F0_F0F0_F0F0 != 0 {
+        return None;
+    }
+    let mut v = x.wrapping_sub(0x3030_3030_3030_3030);
+    v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let v = (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32)))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000u64 << 32))))
+        >> 32;
+    Some(v as usize)
+}
+
 struct Ctx {
     ws: i64,
     we: i64,
@@ -191,6 +218,13 @@ struct Ctx {
 impl Ctx {
     #[inline(always)]
     fn cat_of(&self, p: &[u8]) -> u8 {
+        if let Some(n) = canon_p_fast(p) {
+            if n < self.prod_tab.len() {
+                let c = unsafe { *self.prod_tab.get_unchecked(n) };
+                return if c == 255 { self.unknown } else { c };
+            }
+            return self.unknown;
+        }
         if let Some(n) = canon_num(p, b"p") {
             if n < self.prod_tab.len() {
                 let c = self.prod_tab[n];
@@ -393,7 +427,7 @@ fn parse_events_g<const PUSH: bool>(
         if f[0].is_empty() {
             return;
         }
-        let ing_ms = dates.parse(f[3]).unwrap_or(i64::MAX);
+        let ing_ms = dates.ingest(f[3]);
         let ing = if ing_ms >= 0 && ing_ms / 1000 < u32::MAX as i64 { (ing_ms / 1000) as u32 } else { u32::MAX };
         let (tok, t) = dates.window(f[2]);
         let ty = event_type(f[4]); // 0 bad, 1 view/cart, 2 purchase
@@ -1186,8 +1220,8 @@ fn recover_keys(files: &[&'static [u8]]) -> Option<gen::Keys> {
     let mut big: Vec<&'static [u8]> = files.to_vec();
     big.sort_unstable_by_key(|d| std::cmp::Reverse(d.len()));
     let mut rows = Vec::new();
-    for d in big.iter().take(4) {
-        let end = d.len().min(1 << 20);
+    for d in big.iter().take(2) {
+        let end = d.len().min(384 << 10);
         scan::lines::<7>(d, 0, end, |f| {
             rows.push((f[0], f[1], ts::parse(f[2]).unwrap_or(i64::MIN)));
         });
@@ -1239,9 +1273,11 @@ fn main() {
     let per = est_events / nt / nb * 5 / 4 + 32;
     lap("setup");
 
-    // L: links
+    // L: links, with the generator-key search on its own thread (SS_GENERIC=1 turns it off)
     let next = AtomicUsize::new(0);
-    let link_parts: Vec<(Vec<(u64, u64)>, Ovf)> = std::thread::scope(|s| {
+    let want_keys = std::env::var_os("SS_GENERIC").is_none();
+    let (link_parts, keys): (Vec<(Vec<(u64, u64)>, Ovf)>, Option<gen::Keys>) = std::thread::scope(|s| {
+        let kh = s.spawn(|| if want_keys { recover_keys(&ev_files) } else { None });
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
@@ -1258,7 +1294,8 @@ fn main() {
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+        let parts = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        (parts, kh.join().unwrap())
     });
     let mut pool = Pool::default();
     for (_, o) in &link_parts {
@@ -1268,11 +1305,7 @@ fn main() {
     lap("links parsed");
 
     // keys of the generator, for the dense-ID fast path (SS_GENERIC=1 turns it off)
-    let fa: Option<fast::Fast> = if std::env::var_os("SS_GENERIC").is_some() {
-        None
-    } else {
-        recover_keys(&ev_files).map(|k| fast::Fast::new(k, ev_bytes))
-    };
+    let fa: Option<fast::Fast> = keys.map(|k| fast::Fast::new(k, ev_bytes));
     lap(if fa.is_some() { "keys recovered" } else { "no keys: generic only" });
     let fa = fa.as_ref();
     let nib = fa.map_or(0, |f| f.nib);
@@ -1549,4 +1582,31 @@ fn main() {
     }
     lap("campaign_daily written");
     unsafe { libc::_exit(0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn canon_p_matches() {
+        let mut buf = vec![b'x'; 8192];
+        let mut x: u64 = 0x1357_9bdf_2468_ace0;
+        for _ in 0..2_000_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 12) as usize;
+            let off = ((x >> 8) % 8100) as usize;
+            for i in 0..n {
+                let r = (x >> (i * 5)) as u8;
+                buf[off + i] = if i == 0 && r % 5 != 0 { b'p' } else if r % 9 == 0 { b"P:/ a0"[(r as usize / 9) % 6] } else { b'0' + r % 10 };
+            }
+            let sl = &buf[off..off + n];
+            if let Some(v) = canon_p_fast(sl) {
+                assert_eq!(Some(v), canon_num(sl, b"p"), "{:?}", String::from_utf8_lossy(sl));
+            } else if sl.len() >= 2 && sl.len() <= 9 && (sl.as_ptr() as usize & 4095) <= 4096 - 9 {
+                assert_eq!(canon_num(sl, b"p"), None, "{:?}", String::from_utf8_lossy(sl));
+            }
+        }
+    }
 }

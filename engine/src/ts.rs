@@ -410,6 +410,38 @@ impl Dates {
             (f3_ok | f1_ok, v)
         }
     }
+    /// `ingest_ts`, which the rules say is always F1: a lean path for exactly that form, the
+    /// exact general path otherwise. Returns epoch ms or i64::MAX.
+    #[inline(always)]
+    pub fn ingest(&mut self, f: &[u8]) -> i64 {
+        let p = f.as_ptr();
+        if f.len() == 20 && (p as usize & 4095) <= 4096 - 24 {
+            unsafe {
+                let a = ldp(p, 0);
+                let k2 = std::ptr::read_unaligned(p.add(8) as *const u16);
+                let h = ((a ^ ((k2 as u64) << 21)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+                let c = ldp(p, 11);
+                const SC: u64 = 0x0000_FF00_00FF_0000;
+                let d = |i: u32| -> i64 { ((c >> (8 * i)) & 0xF) as i64 };
+                let hh = d(0) * 10 + d(1);
+                let mi = d(3) * 10 + d(4);
+                let ss = d(6) * 10 + d(7);
+                let ok = (*self.k1.get_unchecked(h) == a)
+                    & (*self.k2.get_unchecked(h) == k2)
+                    & (*p.add(10) == b'T')
+                    & (*p.add(19) == b'Z')
+                    & (c & SC == 0x0000_3A00_003A_0000)
+                    & swar_all_digits(c, !SC)
+                    & (hh <= 23)
+                    & (mi <= 59)
+                    & (ss <= 59);
+                if ok {
+                    return *self.v.get_unchecked(h) + (hh * 3600 + mi * 60 + ss) * 1000;
+                }
+            }
+        }
+        self.parse(f).unwrap_or(i64::MAX)
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +491,7 @@ mod tests {
             let mut pv = v.clone();
             pv.extend_from_slice(b"..........");
             assert_eq!(dates.parse(&pv[..v.len()]), parse_slow(&v), "dates {}", String::from_utf8_lossy(&v));
+            assert_eq!(dates.ingest(&pv[..v.len()]), parse_slow(&v).unwrap_or(i64::MAX), "ingest {}", String::from_utf8_lossy(&v));
             let mut padded = v.clone();
             padded.extend_from_slice(b",2026-10-03T23:58:10Z,xxxxxxxx");
             let (ok, w) = parse_window(&padded[..v.len()]);

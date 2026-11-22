@@ -26,3 +26,4 @@ Scorer v5 (Nov 21 ~9 PM): board reset; 1 in 8 IDs now carry a 32-hex suffix and 
 | 17 | e49a553 | 1.1191 s | correct | same engine as #14, last submission of the night |
 
 Recommendation for the final: 1119b33 (engine of #14/#16/#17: 1.1104 / 1.1057 / 1.1191 s, one slow-machine 1.31 s). It ties 697705f (#11, 1.0995 s, sampled once) on the scorer, uses about 8% less CPU in single-thread profiles, and passes every check. The default entry stays 697705f (best score) unless picked.
+| 18 | 7e5d7cd | 1.1801 s | correct | + events take their person during parsing once union-find is done, category only for purchases, background read-ahead/populate of inputs. No gain on the scorer (within noise, maybe worse) |

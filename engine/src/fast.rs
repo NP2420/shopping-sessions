@@ -303,8 +303,6 @@ pub struct Plan {
     pub home: Vec<u32>,
     /// the bucket's first run continues the last run of the previous non-empty bucket
     pub cont: Vec<bool>,
-    pub lo: Vec<u32>, // click person range per bucket, inclusive
-    pub hi: Vec<u32>,
 }
 
 pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> Plan {
@@ -340,30 +338,12 @@ pub fn classify(a: &[std::sync::OnceLock<BucketA>], fast: &Fast, pt: &PTab) -> P
         }
         env[b] = m;
     }
-    let mut lo = vec![0u32; nib];
-    let mut hi = vec![0u32; nib];
-    for b in 0..nib {
-        lo[b] = if b == 0 { 0 } else { env[b - 1] + 1 };
-        hi[b] = if b + 1 == nib { fast.np as u32 - 1 } else { env[b] };
-    }
-    // a person's clicks must be handled by its home bucket
-    for b in 0..nib {
-        if let Some(ba) = a[b].get() {
-            for (ri, r) in ba.runs.iter().enumerate() {
-                if ri == 0 && cont[b] {
-                    continue;
-                }
-                if r.p < lo[b] || r.p > hi[b] {
-                    pt.set_complex(r.p as usize);
-                }
-            }
-        }
-    }
-    Plan { home, cont, lo, hi }
+    let _ = (&env, m);
+    Plan { home, cont }
 }
 
 pub struct BWork {
-    pub sb: Vec<u64>,
+    pub cbs: Vec<u32>,
     pub cl: Vec<(u32, u32, CItem)>,
     pub ca: Vec<u32>,
     pub ccnt: Vec<u32>,
@@ -371,6 +351,21 @@ pub struct BWork {
     pub evs: Vec<u64>,
     pub name: Vec<u8>,
     pub win: Win,
+}
+
+/// Clicks of persons not finished on the fast path go generic, one click partition per call.
+pub fn generic_clicks(cb: usize, fc: &[Parts<FClk>], fast: &Fast, pt: &PTab, plan: &Plan, links: &LinkTab, shift: u32, gen_cl: &mut Parts<CRec>) {
+    for t in fc {
+        let (x1, x2) = t.get(cb);
+        for c in x1.iter().chain(x2) {
+            let p = c.p as usize;
+            if pt.complex(p) || plan.home[p] == u32::MAX {
+                let num = ((c.p as u64) << ALIAS_BITS) | c.a as u64;
+                let pk = links.get(fast.user_key(num));
+                gen_cl.push(bucket(pk, shift), CRec { pk, ck: c.ck, ts: c.ts, camp: c.camp, _p: 0 });
+            }
+        }
+    }
 }
 
 /// Pass B for one index bucket: simple persons are finished here; everything else goes generic.
@@ -395,58 +390,53 @@ pub fn pass_b(
 ) {
     let empty = BucketA::default();
     let ba = all[b].get().unwrap_or(&empty);
-    let (lo, hi) = (plan.lo[b], plan.hi[b]);
-    // clicks of persons in [lo, hi]
-    w.cl.clear();
-    if lo <= hi {
-        // which persons in [lo, hi] this bucket finishes: one bit each
-        w.sb.clear();
-        w.sb.resize(((hi - lo) as usize >> 6) + 1, 0);
-        for r in &ba.runs {
-            let p = r.p;
-            if p >= lo && p <= hi && !pt.complex(p as usize) && plan.home[p as usize] == b as u32 {
-                let k = (p - lo) as usize;
-                w.sb[k >> 6] |= 1 << (k & 63);
-            }
+    // this bucket's finished persons, and the click partitions that hold their clicks
+    let fin = |p: u32| !pt.complex(p as usize) && plan.home[p as usize] == b as u32;
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    w.cbs.clear();
+    for (ri, r) in ba.runs.iter().enumerate() {
+        if (ri == 0 && plan.cont[b]) || !fin(r.p) {
+            continue;
         }
-        let sb = &w.sb;
-        let simple = |p: u32| {
-            let k = (p - lo) as usize;
-            (sb[k >> 6] >> (k & 63)) & 1 != 0
-        };
-        for cb in (lo >> fast.cshift) as usize..=((hi >> fast.cshift) as usize).min(fast.ncb - 1) {
-            for t in fc {
-                let (x1, x2) = t.get(cb);
-                for c in x1.iter().chain(x2) {
-                    if c.p < lo || c.p > hi {
-                        continue;
-                    }
-                    if simple(c.p) {
-                        w.cl.push((c.p, c.a, CItem { ts: c.ts, camp: c.camp, ck: c.ck }));
-                    } else {
-                        let num = ((c.p as u64) << ALIAS_BITS) | c.a as u64;
-                        let pk = links.get(fast.user_key(num));
-                        gen_cl.push(bucket(pk, shift), CRec { pk, ck: c.ck, ts: c.ts, camp: c.camp, _p: 0 });
-                    }
+        lo = lo.min(r.p);
+        hi = hi.max(r.p);
+        let cb = r.p >> fast.cshift;
+        if w.cbs.last() != Some(&cb) {
+            w.cbs.push(cb);
+        }
+    }
+    w.cbs.sort_unstable();
+    w.cbs.dedup();
+    w.cl.clear();
+    for &cb in &w.cbs {
+        for t in fc {
+            let (x1, x2) = t.get(cb as usize);
+            for c in x1.iter().chain(x2) {
+                if fin(c.p) {
+                    w.cl.push((c.p, c.a, CItem { ts: c.ts, camp: c.camp, ck: c.ck }));
                 }
             }
         }
     }
-    // group local clicks by person (counting sort over the range)
-    let span = if lo <= hi { (hi - lo + 1) as usize } else { 0 };
+    // group the clicks by person: counting sort over [lo, hi], or a plain sort if that is wide
+    let counting = lo <= hi && ((hi - lo) as usize) < 4 * ba.runs.len() + 65_536;
+    if !counting {
+        w.cl.sort_unstable_by_key(|x| x.0);
+    }
+    let span = if counting { (hi - lo + 1) as usize } else { 0 };
     w.ccnt.clear();
     w.ccnt.resize(span + 1, 0);
-    for &(p, _, _) in &w.cl {
-        w.ccnt[(p - lo) as usize + 1] += 1;
-    }
-    for i in 1..w.ccnt.len() {
-        w.ccnt[i] += w.ccnt[i - 1];
-    }
     w.cs.clear();
     w.cs.resize(w.cl.len(), CItem { ts: 0, camp: 0, ck: 0 });
     w.ca.clear();
     w.ca.resize(w.cl.len(), 0);
-    {
+    if counting {
+        for &(p, _, _) in &w.cl {
+            w.ccnt[(p - lo) as usize + 1] += 1;
+        }
+        for i in 1..w.ccnt.len() {
+            w.ccnt[i] += w.ccnt[i - 1];
+        }
         let mut pos = w.ccnt.clone();
         for &(p, a, c) in &w.cl {
             let k = (p - lo) as usize;
@@ -454,14 +444,19 @@ pub fn pass_b(
             w.ca[pos[k] as usize] = a;
             pos[k] += 1;
         }
+    } else {
+        for (j, &(_, a, c)) in w.cl.iter().enumerate() {
+            w.cs[j] = c;
+            w.ca[j] = a;
+        }
     }
     let nruns = ba.runs.len();
-    let mut xi = extras.partition_point(|x| x.0 < lo);
+    let mut xi = extras.partition_point(|x| x.0 < ba.runs.first().map_or(0, |r| r.p));
     for (ri, r) in ba.runs.iter().enumerate() {
         let p = r.p as usize;
         let run = &ba.w[r.start as usize..(r.start + r.len) as usize];
         let is_cont = ri == 0 && plan.cont[b];
-        if pt.complex(p) || (!is_cont && (plan.home[p] != b as u32 || r.p < lo || r.p > hi)) {
+        if pt.complex(p) || (!is_cont && plan.home[p] != b as u32) {
             // generic: the person's component, or the alias's own for the exceptions
             let ppk = if pt.linked(p) { pt.lname[p] } else { fast.user_key((p as u64) << ALIAS_BITS) };
             let mut bi = ba.bad.partition_point(|x| x.0 < r.start);
@@ -533,8 +528,12 @@ pub fn pass_b(
             w.evs.sort_unstable();
         }
         let evs: &[u64] = if copied { &w.evs } else { run };
-        let k = (r.p - lo) as usize;
-        let (ca0, ca1) = (w.ccnt[k] as usize, w.ccnt[k + 1] as usize);
+        let (ca0, ca1) = if counting {
+            let k = (r.p - lo) as usize;
+            (w.ccnt[k] as usize, w.ccnt[k + 1] as usize)
+        } else {
+            (w.cl.partition_point(|x| x.0 < r.p), w.cl.partition_point(|x| x.0 <= r.p))
+        };
         if !w.ca[ca0..ca1].iter().all(|&a| pt.alias_ok(p, a)) {
             // a click by an ID outside the person's component: finish this person generically
             let ppk = if pt.linked(p) { pt.lname[p] } else { fast.user_key((p as u64) << ALIAS_BITS) };

@@ -16,3 +16,4 @@ Scorer v5 (Nov 21 ~9 PM): board reset; 1 in 8 IDs now carry a 32-hex suffix and 
 | # | Commit | Time (practice) | Result | Change / notes |
 |---|--------|-----------------|--------|----------------|
 | 9 | 5378036 | 1.3459 s | correct | v5 baseline: generic path only (keys not recoverable). Long user IDs hit a serial 4M-entry HashMap merge (~0.4 s local). |
+| 10 | 7627552 | 1.1372 s | correct | + concurrent open-addressing table for long user IDs (no serial merge), click IDs as pointer keys (order only), key search off by default |

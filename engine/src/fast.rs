@@ -100,6 +100,14 @@ impl Fast {
     }
 }
 
+#[inline(always)]
+fn prefetch_ptr(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
 pub const COMPLEX: u8 = 1;
 pub const LINKED: u8 = 2;
 
@@ -156,7 +164,11 @@ pub fn ptab_from_roots(sl: &[[u64; 2]], pool: &Pool, fast: &Fast) -> PTab {
     let mut wide: std::collections::HashMap<u32, Box<[u64; 8]>> = std::collections::HashMap::new();
     let mut num = vec![u64::MAX; sl.len()];
     let mut buf = Vec::with_capacity(16);
+    const D: usize = 16;
     for (i, s) in sl.iter().enumerate() {
+        if i + D < sl.len() && sl[i + D][0] != EMPTY {
+            prefetch_ptr(unsafe { owner.as_ptr().add(sl[i + D][1] as usize) } as *const u8);
+        }
         let k = s[0];
         if k == EMPTY {
             continue;
@@ -180,6 +192,15 @@ pub fn ptab_from_roots(sl: &[[u64; 2]], pool: &Pool, fast: &Fast) -> PTab {
         *o = if *o == NONE || *o == who { who } else { MIXED };
     }
     for (i, s) in sl.iter().enumerate() {
+        if i + D < sl.len() && num[i + D] != u64::MAX {
+            let r2 = sl[i + D][1] as usize;
+            let p2 = (num[i + D] >> ALIAS_BITS) as usize;
+            prefetch_ptr(unsafe { sl.as_ptr().add(r2) } as *const u8);
+            prefetch_ptr(unsafe { owner.as_ptr().add(r2) } as *const u8);
+            prefetch_ptr(unsafe { lmask.as_ptr().add(p2) } as *const u8);
+            prefetch_ptr(unsafe { lname.as_ptr().add(p2) } as *const u8);
+            prefetch_ptr(unsafe { flags.as_ptr().add(p2) } as *const u8);
+        }
         let n = num[i];
         if n == u64::MAX {
             continue;

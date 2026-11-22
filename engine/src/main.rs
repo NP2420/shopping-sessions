@@ -671,7 +671,11 @@ fn try_links(edges: &[Vec<(u64, u64)>], pool: &Pool, cap: usize, fa: Option<&fas
         }
     }
     // here every slot's value is its root's slot index: the fast path's person table needs that
+    let tp = std::time::Instant::now();
     let pt = fa.map(|f| fast::ptab_from_roots(&sl, pool, f));
+    if std::env::var_os("SS_VERBOSE").is_some() {
+        eprintln!("  ptab {:.1} ms", tp.elapsed().as_secs_f64() * 1e3);
+    }
     for i in 0..cap {
         if sl[i][0] != EMPTY {
             let r = sl[i][1] as usize;

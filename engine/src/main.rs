@@ -1479,14 +1479,20 @@ fn main() {
     let fcper = fa.map_or(4, |f| cl_bytes / 48 / nt / f.ncb * 3 / 2 + 64);
     let ne_tasks = ev_chunks.len() + cl_chunks.len();
     #[allow(clippy::type_complexity)]
-    let (ev_parts, (links, ptab)): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, part::Parts<fast::FClk>, Vec<CRec>)>, (LinkTab, Option<fast::PTab>)) = std::thread::scope(|s| {
+    // the link table, published as soon as union-find is done: clicks parsed after that go
+    // straight to their person partitions
+    let link_cell: std::sync::OnceLock<LinkTab> = std::sync::OnceLock::new();
+    let cper = cl_bytes / 48 / nt / nb * 3 / 2 + 32;
+    let cper = if fa.is_some() { cper / 4 + 32 } else { cper };
+    let (ev_parts, ptab): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, part::Parts<fast::FClk>, Vec<CRec>, part::Parts<CRec>)>, Option<fast::PTab>) = std::thread::scope(|s| {
         let uf = s.spawn(|| {
             let t = std::time::Instant::now();
-            let r = build_links(&edges, &pool, fa);
+            let (lt, pt) = build_links(&edges, &pool, fa);
+            let _ = link_cell.set(lt);
             if verbose {
                 eprintln!("uf + ptab {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             }
-            r
+            pt
         });
         let hs: Vec<_> = (0..nt)
             .map(|_| {
@@ -1495,6 +1501,7 @@ fn main() {
                     let mut fb = part::Parts::<fast::FRec>::new(nib.max(1), fper);
                     let mut fc = part::Parts::<fast::FClk>::new(ncb, fcper);
                     let mut ct = Vec::new();
+                    let mut pc = part::Parts::<CRec>::new(nb, if fa.is_some() { 4 } else { cper });
                     let o = &pool;
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -1505,28 +1512,36 @@ fn main() {
                             prof!(0, parse_events(ev_chunks[i], &ctx, shift, &mut b, o, fa, &mut fb));
                         } else {
                             prof!(1, parse_clicks(cl_chunks[i - ev_chunks.len()], &ctx, o, &mut ct, fa, &mut fc));
+                            if let Some(lt) = link_cell.get() {
+                                prof!(5, resolve_clicks(&ct, lt, shift, &mut pc));
+                                ct.clear();
+                            }
                         }
                     }
                     b.finish();
                     fb.finish();
                     fc.finish();
-                    (b, fb, fc, ct)
+                    pc.finish();
+                    (b, fb, fc, ct, pc)
                 })
             })
             .collect();
         let parts = hs.into_iter().map(|h| h.join().unwrap()).collect();
         (parts, uf.join().unwrap())
     });
+    let links = link_cell.into_inner().unwrap();
     lap("events parsed + union-find");
     let mut ev: Vec<part::Parts<EvRec>> = Vec::with_capacity(nt);
     let mut fev: Vec<part::Parts<fast::FRec>> = Vec::with_capacity(nt);
     let mut fcl: Vec<part::Parts<fast::FClk>> = Vec::with_capacity(nt);
     let mut ctmp: Vec<Vec<CRec>> = Vec::with_capacity(nt);
-    for (a, b, c, d) in ev_parts {
+    let mut pcl = Vec::with_capacity(3 * nt);
+    for (a, b, c, d, e) in ev_parts {
         ev.push(a);
         fev.push(b);
         fcl.push(c);
         ctmp.push(d);
+        pcl.push(e);
     }
     let fp: Option<(&fast::Fast, &fast::PTab)> = fa.zip(ptab.as_ref());
 
@@ -1536,8 +1551,7 @@ fn main() {
     let ntasks = ncl + nb + nib;
     let pper = est_events / nt / nb + 32;
     let pper = if fa.is_some() { pper / 4 + 32 } else { pper * 3 / 2 };
-    let cper = cl_bytes / 48 / nt / nb * 3 / 2 + 32;
-    let cper = if fa.is_some() { cper / 4 + 32 } else { cper };
+    let cper = cl_bytes / 48 / nt / nb / 8 + 32; // leftovers only: most clicks were placed during parsing
     let bucket_a: Vec<std::sync::OnceLock<fast::BucketA>> = (0..nib).map(|_| std::sync::OnceLock::new()).collect();
     let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, Vec<(u32, u32, u32, u32)>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
@@ -1575,7 +1589,6 @@ fn main() {
     });
     lap("dedup + clicks + pass A");
     let mut pev = Vec::with_capacity(2 * nt + 1);
-    let mut pcl = Vec::with_capacity(2 * nt);
     let mut extras: Vec<(u32, u32, u32, u32)> = Vec::new();
     for (a, b, x) in d_parts {
         pev.push(a);

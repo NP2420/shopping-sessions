@@ -741,7 +741,8 @@ struct CItem {
 
 struct Acc {
     // campaign_daily accumulators, (ncamp + 1) x ndays: sessions, purchasing, revenue, assisted
-    camp: Vec<[i64; 4]>,
+    camp: Vec<[i64; 4]>, // [3] unused: assists live in `ass`, a small array that stays in cache
+    ass: Vec<u32>,
     ndays: usize,
 }
 
@@ -1072,7 +1073,7 @@ fn sessions(name: &[u8], evs: &[u64], cls: &[CItem], ctx: &Ctx, win: &mut Win, a
         a[1] += bought as i64;
         a[2] += rev;
         for &c in &win.active {
-            acc.camp[c as usize * ndays + di][3] += 1;
+            acc.ass[c as usize * ndays + di] += 1;
         }
         i = j;
     }
@@ -1426,7 +1427,7 @@ fn main() {
                 .map(|_| {
                     let (bucket_a, fcl, plan, links, pool, ctx, next) = (&bucket_a, &fcl, &plan, &links, &pool, &ctx, &next);
                     s.spawn(move || {
-                        let mut acc = Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays };
+                        let mut acc = Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ass: vec![0; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays };
                         let mut uo = UserOut::default();
                         let mut ge = part::Parts::<PRec>::new(nb, 64);
                         let mut gc = part::Parts::<CRec>::new(nb, 32);
@@ -1454,7 +1455,7 @@ fn main() {
         lap("fast persons done");
     } else {
         for _ in 0..nt {
-            outs.push((UserOut::default(), Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays }));
+            outs.push((UserOut::default(), Acc { camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays], ass: vec![0; (ncamp + 1) * ctx.ndays], ndays: ctx.ndays }));
         }
     }
 
@@ -1497,10 +1498,11 @@ fn main() {
     let nd = ctx.ndays;
     let mut tot = vec![[0i64; 4]; (ncamp + 1) * nd];
     for a in &accs {
-        for (x, y) in tot.iter_mut().zip(&a.camp) {
-            for k in 0..4 {
+        for ((x, y), z) in tot.iter_mut().zip(&a.camp).zip(&a.ass) {
+            for k in 0..3 {
                 x[k] += y[k];
             }
+            x[3] += *z as i64;
         }
     }
     let mut cid = pq::Bytes::default();

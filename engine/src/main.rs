@@ -473,21 +473,11 @@ fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn parse_clicks(
-    c: Chunk,
-    ctx: &Ctx,
-    links: &LinkTab,
-    shift: u32,
-    out: &mut part::Parts<CRec>,
-    ovf: &mut Ovf,
-    tmp: &mut Vec<CRec>,
-    fp: Option<(&fast::Fast, &fast::PTab)>,
-    fout: &mut part::Parts<fast::FClk>,
-) {
+/// Clicks: dense users go straight to the fast path's person partitions; the rest keep their
+/// user key in `tmp` until the links are known (see `resolve_clicks`).
+fn parse_clicks(c: Chunk, ctx: &Ctx, ovf: &mut Ovf, tmp: &mut Vec<CRec>, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FClk>) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
-    tmp.clear();
     let mut dates = ts::Dates::new();
     scan::lines::<4>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
@@ -502,11 +492,10 @@ fn parse_clicks(
             return;
         }
         let ck = ids::key(f[0], ovf);
-        if let Some((fa, pt)) = fp {
+        if let Some(fa) = fa {
             if let Some(n) = fa.user_number(f[1]) {
                 let p = (n >> gen::ALIAS_BITS) as u32;
                 let a = (n & ((1 << gen::ALIAS_BITS) - 1)) as u32;
-                let _ = pt; // the alias check happens in pass B, per person
                 fout.push((p >> fa.cshift) as usize, fast::FClk { p, a, ts: (t - lo) as u32, camp, ck, _p: 0 });
                 return;
             }
@@ -514,6 +503,10 @@ fn parse_clicks(
         let uk = ids::key(f[1], ovf);
         tmp.push(CRec { pk: uk, ck, ts: (t - lo) as u32, camp, _p: 0 });
     });
+}
+
+/// Maps the user keys of generic clicks to persons and partitions them.
+fn resolve_clicks(tmp: &[CRec], links: &LinkTab, shift: u32, out: &mut part::Parts<CRec>) {
     const D: usize = 16;
     for i in 0..tmp.len() {
         if i + D < tmp.len() {
@@ -1288,7 +1281,12 @@ fn main() {
     // E: events, with union-find (and the fast path's person table) on its own thread
     let next = AtomicUsize::new(0);
     let gper = if fa.is_some() { per / 8 + 32 } else { per };
-    let (ev_parts, (links, ptab)): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, Ovf)>, (LinkTab, Option<fast::PTab>)) = std::thread::scope(|s| {
+    let ncb = fa.map_or(1, |f| f.ncb);
+    let cl_bytes: usize = cl_files.iter().map(|d| d.len()).sum();
+    let fcper = fa.map_or(4, |f| cl_bytes / 48 / nt / f.ncb * 3 / 2 + 64);
+    let ne_tasks = ev_chunks.len() + cl_chunks.len();
+    #[allow(clippy::type_complexity)]
+    let (ev_parts, (links, ptab)): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, part::Parts<fast::FClk>, Vec<CRec>, Ovf)>, (LinkTab, Option<fast::PTab>)) = std::thread::scope(|s| {
         let uf = s.spawn(|| {
             let t = std::time::Instant::now();
             let r = build_links(&edges, &pool, fa);
@@ -1302,17 +1300,24 @@ fn main() {
                 s.spawn(|| {
                     let mut b = part::Parts::<EvRec>::new(nb, gper);
                     let mut fb = part::Parts::<fast::FRec>::new(nib.max(1), fper);
+                    let mut fc = part::Parts::<fast::FClk>::new(ncb, fcper);
+                    let mut ct = Vec::new();
                     let mut o = Ovf::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= ev_chunks.len() {
+                        if i >= ne_tasks {
                             break;
                         }
-                        parse_events(ev_chunks[i], &ctx, shift, &mut b, &mut o, fa, &mut fb);
+                        if i < ev_chunks.len() {
+                            parse_events(ev_chunks[i], &ctx, shift, &mut b, &mut o, fa, &mut fb);
+                        } else {
+                            parse_clicks(cl_chunks[i - ev_chunks.len()], &ctx, &mut o, &mut ct, fa, &mut fc);
+                        }
                     }
                     b.finish();
                     fb.finish();
-                    (b, fb, o)
+                    fc.finish();
+                    (b, fb, fc, ct, o)
                 })
             })
             .collect();
@@ -1320,39 +1325,38 @@ fn main() {
         (parts, uf.join().unwrap())
     });
     lap("events parsed + union-find");
-    for (_, _, o) in &ev_parts {
+    for (_, _, _, _, o) in &ev_parts {
         pool.extend(o.iter().copied());
     }
     let mut ev: Vec<part::Parts<EvRec>> = Vec::with_capacity(nt);
     let mut fev: Vec<part::Parts<fast::FRec>> = Vec::with_capacity(nt);
-    for (a, b, _) in ev_parts {
+    let mut fcl: Vec<part::Parts<fast::FClk>> = Vec::with_capacity(nt);
+    let mut ctmp: Vec<Vec<CRec>> = Vec::with_capacity(nt);
+    for (a, b, c, d, _) in ev_parts {
         ev.push(a);
         fev.push(b);
+        fcl.push(c);
+        ctmp.push(d);
     }
     let fp: Option<(&fast::Fast, &fast::PTab)> = fa.zip(ptab.as_ref());
 
     // D: clicks, generic dedup buckets, fast pass A
     let next = AtomicUsize::new(0);
-    let ntasks = cl_chunks.len() + nb + nib;
+    let ncl = ctmp.len();
+    let ntasks = ncl + nb + nib;
     let pper = est_events / nt / nb + 32;
     let pper = if fa.is_some() { pper / 4 + 32 } else { pper * 3 / 2 };
-    let cl_bytes: usize = cl_files.iter().map(|d| d.len()).sum();
     let cper = cl_bytes / 48 / nt / nb * 3 / 2 + 32;
     let cper = if fa.is_some() { cper / 4 + 32 } else { cper };
-    let ncb = fa.map_or(1, |f| f.ncb);
-    let fcper = fa.map_or(4, |f| cl_bytes / 48 / nt / f.ncb * 3 / 2 + 64);
     let bucket_a: Vec<std::sync::OnceLock<fast::BucketA>> = (0..nib).map(|_| std::sync::OnceLock::new()).collect();
-    let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, part::Parts<fast::FClk>, Ovf, Vec<(u32, u32, u32, u32)>)> = std::thread::scope(|s| {
+    let d_parts: Vec<(part::Parts<PRec>, part::Parts<CRec>, Vec<(u32, u32, u32, u32)>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
                     let mut pe = part::Parts::<PRec>::new(nb, pper);
                     let mut pc = part::Parts::<CRec>::new(nb, cper);
-                    let mut fc = part::Parts::<fast::FClk>::new(ncb, fcper);
-                    let mut o = Ovf::new();
                     let mut table = Vec::new();
                     let mut win = Vec::new();
-                    let mut tmp = Vec::new();
                     let mut slots = Vec::new();
                     let mut ex = Vec::new();
                     loop {
@@ -1360,12 +1364,12 @@ fn main() {
                         if i >= ntasks {
                             break;
                         }
-                        if i < cl_chunks.len() {
-                            parse_clicks(cl_chunks[i], &ctx, &links, shift, &mut pc, &mut o, &mut tmp, fp, &mut fc);
-                        } else if i < cl_chunks.len() + nb {
-                            dedup_bucket(i - cl_chunks.len(), &ev, &links, shift, &mut table, &mut win, &mut pe, fp, &pool, &mut ex);
+                        if i < ncl {
+                            resolve_clicks(&ctmp[i], &links, shift, &mut pc);
+                        } else if i < ncl + nb {
+                            dedup_bucket(i - ncl, &ev, &links, shift, &mut table, &mut win, &mut pe, fp, &pool, &mut ex);
                         } else {
-                            let b = i - cl_chunks.len() - nb;
+                            let b = i - ncl - nb;
                             let (f, pt) = fp.unwrap();
                             let r = fast::pass_a(b, &fev, f, pt, &links, shift, &mut slots, &mut pe);
                             let _ = bucket_a[b].set(r);
@@ -1373,25 +1377,19 @@ fn main() {
                     }
                     pe.finish();
                     pc.finish();
-                    fc.finish();
-                    (pe, pc, fc, o, ex)
+                    (pe, pc, ex)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     lap("dedup + clicks + pass A");
-    for (_, _, _, o, _) in &d_parts {
-        pool.extend(o.iter().copied());
-    }
     let mut pev = Vec::with_capacity(2 * nt + 1);
     let mut pcl = Vec::with_capacity(2 * nt);
-    let mut fcl = Vec::with_capacity(nt);
     let mut extras: Vec<(u32, u32, u32, u32)> = Vec::new();
-    for (a, b, c, _, x) in d_parts {
+    for (a, b, x) in d_parts {
         pev.push(a);
         pcl.push(b);
-        fcl.push(c);
         extras.extend(x);
     }
     extras.sort_unstable();

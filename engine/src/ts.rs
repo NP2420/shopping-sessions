@@ -280,6 +280,23 @@ pub fn parse_window(f: &[u8]) -> (bool, i64) {
 }
 
 
+
+/// `HH:MM:SS` loaded little-endian as `c` (bytes 11..19 of an F1/F2 timestamp): (valid, ms in day).
+/// Branch-free: digits and separators checked with SWAR, ranges with one compare per field.
+#[inline(always)]
+fn hms(c: u64) -> (bool, i64) {
+    const SC: u64 = 0x0000_FF00_00FF_0000;
+    let shape = (c & SC == 0x0000_3A00_003A_0000) & swar_all_digits(c, !SC);
+    let v = c & 0x0F0F_000F_0F00_0F0F; // digits as values, separators cleared
+    // tens*10 + units for each pair, landing in bytes 1, 4 and 7
+    let pairs = (v.wrapping_mul(10 << 8)).wrapping_add(v) ;
+    let hh = ((pairs >> 8) & 0xFF) as i64;
+    let mi = ((pairs >> 32) & 0xFF) as i64;
+    let ss = ((pairs >> 56) & 0xFF) as i64;
+    let ok = shape & (hh <= 23) & (mi <= 59) & (ss <= 59);
+    (ok, (hh * 3600 + mi * 60 + ss) * 1000)
+}
+
 /// Direct-mapped cache of validated dates: the exact 10 bytes `YYYY-MM-DD` to the day's epoch ms.
 pub struct Dates {
     k1: [u64; 64],
@@ -397,14 +414,9 @@ impl Dates {
                     None => (false, 0),
                 };
             }
-            let c = ldp(p, 11);
-            const SC: u64 = 0x0000_FF00_00FF_0000;
-            let d = |i: u32| -> i64 { ((c >> (8 * i)) & 0xF) as i64 };
-            let hh = d(0) * 10 + d(1);
-            let mi = d(3) * 10 + d(4);
-            let ss = d(6) * 10 + d(7);
-            let tok = (*p.add(10) == b'T') & (c & SC == 0x0000_3A00_003A_0000) & swar_all_digits(c, !SC) & (hh <= 23) & (mi <= 59) & (ss <= 59);
-            let f1 = *self.v.get_unchecked(h) + (hh * 3600 + mi * 60 + ss) * 1000;
+            let (hok, tms) = hms(ldp(p, 11));
+            let tok = (*p.add(10) == b'T') & hok;
+            let f1 = *self.v.get_unchecked(h) + tms;
             let f1_ok = is20 & hit & tok;
             let v = if f3_ok { f3 } else { f1 };
             (f3_ok | f1_ok, v)
@@ -420,23 +432,10 @@ impl Dates {
                 let a = ldp(p, 0);
                 let k2 = std::ptr::read_unaligned(p.add(8) as *const u16);
                 let h = ((a ^ ((k2 as u64) << 21)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
-                let c = ldp(p, 11);
-                const SC: u64 = 0x0000_FF00_00FF_0000;
-                let d = |i: u32| -> i64 { ((c >> (8 * i)) & 0xF) as i64 };
-                let hh = d(0) * 10 + d(1);
-                let mi = d(3) * 10 + d(4);
-                let ss = d(6) * 10 + d(7);
-                let ok = (*self.k1.get_unchecked(h) == a)
-                    & (*self.k2.get_unchecked(h) == k2)
-                    & (*p.add(10) == b'T')
-                    & (*p.add(19) == b'Z')
-                    & (c & SC == 0x0000_3A00_003A_0000)
-                    & swar_all_digits(c, !SC)
-                    & (hh <= 23)
-                    & (mi <= 59)
-                    & (ss <= 59);
+                let (hok, tms) = hms(ldp(p, 11));
+                let ok = (*self.k1.get_unchecked(h) == a) & (*self.k2.get_unchecked(h) == k2) & (*p.add(10) == b'T') & (*p.add(19) == b'Z') & hok;
                 if ok {
-                    return *self.v.get_unchecked(h) + (hh * 3600 + mi * 60 + ss) * 1000;
+                    return *self.v.get_unchecked(h) + tms;
                 }
             }
         }
@@ -464,6 +463,19 @@ mod tests {
         assert_eq!(parse(b"2026-10-03T23:58:10-00:00"), Some(f1));
         assert_eq!(parse(b"123456789012345678901"), Some(i64::MAX));
         assert_eq!(parse(b"86400000"), Some(86_400_000));
+        for h in 0..30u64 {
+            for m in [0u64, 7, 59, 60, 99] {
+                for sx in [0u64, 9, 59, 60] {
+                    let st = format!("{:02}:{:02}:{:02}", h, m, sx);
+                    let c = u64::from_le_bytes(st.as_bytes().try_into().unwrap());
+                    let (ok, v) = hms(c);
+                    assert_eq!(ok, h <= 23 && m <= 59 && sx <= 59, "{st}");
+                    if ok {
+                        assert_eq!(v, ((h * 3600 + m * 60 + sx) * 1000) as i64, "{st}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

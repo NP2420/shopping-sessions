@@ -20,6 +20,22 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// --features prof: cycle counts per section, summed over threads, printed at exit
+#[cfg(feature = "prof")]
+static PROF: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+#[cfg(feature = "prof")]
+const PROF_NAMES: [&str; 16] = ["ev parse", "cl parse", "dd insert", "dd scan", "dd link+push", "cl resolve", "pb table", "pb scatter", "pb clicks", "pb sort", "pb sessions", "write", "", "", "", ""];
+macro_rules! prof {
+    ($i:expr, $e:expr) => {{
+        #[cfg(feature = "prof")]
+        let t0 = unsafe { std::arch::x86_64::_rdtsc() };
+        let r = $e;
+        #[cfg(feature = "prof")]
+        PROF[$i].fetch_add(unsafe { std::arch::x86_64::_rdtsc() } - t0, Ordering::Relaxed);
+        r
+    }};
+}
+
 #[global_allocator]
 static ALLOC: arena::Arena = arena::Arena;
 
@@ -706,6 +722,7 @@ fn dedup_bucket(
     let mask = cap - 1;
     table.clear();
     table.resize(cap, (EMPTY, std::ptr::null()));
+prof!(2, {
     for t in ev {
       let (v1, v2) = t.get(b);
       for v in [v1, v2] {
@@ -731,6 +748,8 @@ fn dedup_bucket(
         }
       }
     }
+
+});prof!(3, {
     win.clear();
     for s in table.iter() {
         if s.0 == EMPTY {
@@ -756,6 +775,8 @@ fn dedup_bucket(
         }
         win.push(PRec { pk: r.user, ts: r.ts, pc: r.pc });
     }
+
+});prof!(4, {
     const D: usize = 16;
     for i in 0..win.len() {
         if i + D < win.len() {
@@ -765,7 +786,8 @@ fn dedup_bucket(
         r.pk = links.get(r.pk);
         out.push(bucket(r.pk, shift), r);
     }
-}
+
+});}
 
 // ---------------------------------------------------------------- per person
 
@@ -881,6 +903,7 @@ fn person_bucket(
     w.lids.clear();
     w.cnt.clear();
     w.pks.clear();
+prof!(6, {
     for t in pev {
         let (x1, x2) = t.get(b);
         for r in x1.iter().chain(x2) {
@@ -916,7 +939,8 @@ fn person_bucket(
             w.cnt[lid as usize] += 1;
         }
     }
-    let np = w.pks.len();
+
+});    let np = w.pks.len();
     w.off.clear();
     w.off.reserve(np + 1);
     let mut s = 0u32;
@@ -925,6 +949,7 @@ fn person_bucket(
         s += c;
     }
     w.off.push(s);
+prof!(7, {
     w.sorted.clear();
     w.sorted.resize(nev, 0);
     {
@@ -940,6 +965,8 @@ fn person_bucket(
             }
         }
     }
+
+});prof!(8, {
     // clicks of the same people
     w.clid.clear();
     w.ccnt.clear();
@@ -989,12 +1016,14 @@ fn person_bucket(
             }
         }
     }
-    for p in 0..np {
+
+});    for p in 0..np {
         let (a, z) = (w.off[p] as usize, w.off[p + 1] as usize);
         let evs = &mut w.sorted[a..z];
-        evs.sort_unstable();
+        prof!(9, evs.sort_unstable());
         let (ca, cz) = (w.coff[p] as usize, w.coff[p + 1] as usize);
         let cls = &mut w.csorted[ca..cz];
+        prof!(9, {
         if cls.len() > 1 {
             cls.sort_unstable_by(|x, y| {
                 x.ts.cmp(&y.ts).then_with(|| {
@@ -1006,9 +1035,10 @@ fn person_bucket(
                 })
             });
         }
+        });
         w.name.clear();
         ids::decode_into(w.pks[p], pool, &mut w.name);
-        sessions(&w.name, evs, cls, ctx, &mut w.win, acc, uo);
+        prof!(10, sessions(&w.name, evs, cls, ctx, &mut w.win, acc, uo));
     }
 }
 
@@ -1363,9 +1393,9 @@ fn main() {
                             break;
                         }
                         if i < ev_chunks.len() {
-                            parse_events(ev_chunks[i], &ctx, shift, &mut b, o, fa, &mut fb);
+                            prof!(0, parse_events(ev_chunks[i], &ctx, shift, &mut b, o, fa, &mut fb));
                         } else {
-                            parse_clicks(cl_chunks[i - ev_chunks.len()], &ctx, o, &mut ct, fa, &mut fc);
+                            prof!(1, parse_clicks(cl_chunks[i - ev_chunks.len()], &ctx, o, &mut ct, fa, &mut fc));
                         }
                     }
                     b.finish();
@@ -1416,7 +1446,7 @@ fn main() {
                             break;
                         }
                         if i < ncl {
-                            resolve_clicks(&ctmp[i], &links, shift, &mut pc);
+                            prof!(5, resolve_clicks(&ctmp[i], &links, shift, &mut pc));
                         } else if i < ncl + nb {
                             dedup_bucket(i - ncl, &ev, &links, shift, &mut table, &mut win, &mut pe, fp, &pool, &mut ex);
                         } else {
@@ -1617,6 +1647,20 @@ fn main() {
         let _ = h.join();
     }
     lap("background writes done");
+    #[cfg(feature = "prof")]
+    {
+        let ghz = 1e-6 * {
+            let (c0, t) = (unsafe { std::arch::x86_64::_rdtsc() }, std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            (unsafe { std::arch::x86_64::_rdtsc() } - c0) as f64 / t.elapsed().as_secs_f64()
+        };
+        for i in 0..16 {
+            let c = PROF[i].load(Ordering::Relaxed);
+            if c > 0 {
+                eprintln!("  prof {:>14} {:8.1} ms (thread-sum)", PROF_NAMES[i], c as f64 / ghz / 1e3 * 1e3 / 1e3);
+            }
+        }
+    }
     unsafe { libc::_exit(0) }
 }
 

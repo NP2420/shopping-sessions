@@ -10,3 +10,9 @@
 | 6 | 763eb19 | 0.8993 s | correct | + SWAR product ids, key search overlapped with links (smaller sample), lean ingest parse, pre-reserved buffers |
 | 7 | f801706 | 0.8762 s | correct | + 24-byte fast records (no padding; write-combining for any record size) |
 | 8 | b4cae74 | 0.8409 s | correct | + 8-byte pass-A winners with alias exceptions (runs read in place), forward extras walk, finished-person bitmap, unquote w/o empty test, SWAR time of day |
+
+Scorer v5 (Nov 21 ~9 PM): board reset; 1 in 8 IDs now carry a 32-hex suffix and the ID bijection is keyed per seed, so the key-recovery fast path never fires. Scores below are v5.
+
+| # | Commit | Time (practice) | Result | Change / notes |
+|---|--------|-----------------|--------|----------------|
+| 9 | 5378036 | 1.3459 s | correct | v5 baseline: generic path only (keys not recoverable). Long user IDs hit a serial 4M-entry HashMap merge (~0.4 s local). |

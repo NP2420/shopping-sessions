@@ -1453,6 +1453,8 @@ fn main() {
     let ncamp = ctx.camp_names.len();
 
     let urows = est_events / 7 / nt + 1024; // user-day rows per thread, with headroom
+    let mut writers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let fast_written = fp.is_some();
     // B: simple persons straight from index order
     let mut outs: Vec<(UserOut, Acc)> = Vec::with_capacity(nt);
     if let Some((f, pt)) = fp {
@@ -1498,8 +1500,15 @@ fn main() {
                 .collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        for (uo, acc, ge, gc) in b_parts {
-            outs.push((uo, acc));
+        // the big user_daily parts are written in the background while the generic persons run
+        for (t, (uo, acc, ge, gc)) in b_parts.into_iter().enumerate() {
+            let path = ud.join(format!("part-b{t:03}.parquet"));
+            writers.push(std::thread::spawn(move || {
+                if uo.rows > 0 || t == 0 {
+                    write_users(&path, &uo);
+                }
+            }));
+            outs.push((UserOut::with_rows(urows / 16 + 64), acc));
             pev.push(ge);
             pcl.push(gc);
         }
@@ -1534,7 +1543,7 @@ fn main() {
                         }
                         person_bucket(order[i].1, pev, pcl, ctx, pool, &mut w, &mut acc, &mut uo);
                     }
-                    if uo.rows > 0 || t == 0 {
+                    if uo.rows > 0 || (t == 0 && !fast_written) {
                         write_users(&ud.join(format!("part-{t:03}.parquet")), &uo);
                     }
                     acc
@@ -1600,6 +1609,10 @@ fn main() {
         pq::write(&path, rows, &cols).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
     }
     lap("campaign_daily written");
+    for h in writers {
+        let _ = h.join();
+    }
+    lap("background writes done");
     unsafe { libc::_exit(0) }
 }
 

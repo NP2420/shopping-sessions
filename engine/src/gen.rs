@@ -208,7 +208,10 @@ pub struct Sample<'a> {
 
 /// Recovers the user and event keys, or None if the data does not look generated.
 /// `max_users` and `max_events` bound the dense ranges (estimates with headroom).
+pub static STAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 pub fn recover(s: &Sample, max_users: u64, max_events: u64) -> Option<Keys> {
+    use std::sync::atomic::Ordering::Relaxed;
+    STAGE.store(11, Relaxed);
     // user key: the most common user ID is a big person's first alias, number p << 9, p small
     let mut counts: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
     for &(_, u, _) in &s.rows {
@@ -222,6 +225,7 @@ pub fn recover(s: &Sample, max_users: u64, max_events: u64) -> Option<Keys> {
     if users.len() < 100 {
         return None;
     }
+    STAGE.store(12, Relaxed);
     let mut user_key = None;
     'outer: for &(id, _) in top.iter().take(3) {
         let h = half(b36(id, b'u').unwrap());
@@ -238,6 +242,7 @@ pub fn recover(s: &Sample, max_users: u64, max_events: u64) -> Option<Keys> {
         }
     }
     let user_key = user_key?;
+    STAGE.store(13, Relaxed);
     // event key: person 0's events are numbered from 0 in time order, so the earliest sampled
     // event of person 0 has a small index
     let mut p0: Vec<(i64, u64)> = s
@@ -268,6 +273,7 @@ pub fn recover(s: &Sample, max_users: u64, max_events: u64) -> Option<Keys> {
             }
             let ok = evs.iter().filter(|&&o| unscramble(o, key) < max_events).count();
             if ok * 1000 >= evs.len() * 995 {
+                STAGE.store(10, Relaxed);
                 return Some(Keys { user: user_key, event: key });
             }
         }

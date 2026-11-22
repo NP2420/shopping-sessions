@@ -388,3 +388,310 @@ impl Bytes {
         self.0.extend_from_slice(s);
     }
 }
+
+// ---------------------------------------------------------------- dictionary-encoded columns
+
+/// A column for `write_dict`: PLAIN values, or a dictionary (PLAIN-encoded entries) and one key
+/// per non-null value.
+pub enum Enc {
+    Plain(Vec<u8>),
+    Dict { dict: Vec<u8>, ndict: usize, keys: Vec<u32> },
+}
+
+pub struct DCol<'a> {
+    pub name: &'a str,
+    pub ptype: i32,
+    pub logical: Logical,
+    pub optional: bool,
+    pub defs: Option<&'a [u8]>,
+    pub enc: Enc,
+}
+
+fn bit_width(max: u32) -> u32 {
+    (32 - max.leading_zeros()).max(1)
+}
+
+/// Bit width byte, then one bit-packed run of `keys` (padded to a multiple of 8).
+fn hybrid_keys(keys: &[u32], w: u32, out: &mut Vec<u8>) {
+    out.push(w as u8);
+    let groups = (keys.len() + 7) / 8;
+    let mut h = ((groups as u64) << 1) | 1;
+    while h >= 0x80 {
+        out.push((h as u8) | 0x80);
+        h >>= 7;
+    }
+    out.push(h as u8);
+    let start = out.len();
+    out.resize(start + groups * w as usize, 0);
+    let buf = &mut out[start..];
+    let mut acc = 0u64;
+    let mut bits = 0u32;
+    let mut o = 0usize;
+    for g in 0..groups * 8 {
+        let k = if g < keys.len() { keys[g] as u64 } else { 0 };
+        acc |= k << bits;
+        bits += w;
+        while bits >= 8 {
+            buf[o] = acc as u8;
+            o += 1;
+            acc >>= 8;
+            bits -= 8;
+        }
+    }
+    if bits > 0 {
+        buf[o] = acc as u8;
+    }
+}
+
+fn page_header(t: &mut Thrift, ptype: i32, len: usize) {
+    t.begin();
+    t.i32f(1, ptype);
+    t.i32f(2, len as i32);
+    t.i32f(3, len as i32);
+}
+
+/// Like `write`, but columns may be dictionary encoded (a PLAIN dictionary page, then a data
+/// page of RLE_DICTIONARY keys). One row group; uncompressed.
+pub fn write_dict(path: &std::path::Path, num_rows: usize, cols: &[DCol]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file: Vec<u8> = Vec::new();
+    file.extend_from_slice(b"PAR1");
+    // per column: (chunk start, chunk size, data page offset, dictionary page offset or 0)
+    let mut meta: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(cols.len());
+    if num_rows > 0 {
+        for c in cols {
+            let start = file.len();
+            let mut levels = Vec::new();
+            if c.optional {
+                def_levels(c.defs.expect("optional column needs defs"), &mut levels);
+            }
+            let mut dict_off = 0usize;
+            let (body, enc_id): (Vec<u8>, i32) = match &c.enc {
+                Enc::Plain(v) => {
+                    let mut b = levels;
+                    b.extend_from_slice(v);
+                    (b, 0)
+                }
+                Enc::Dict { ndict: 0, .. } => (levels, 0), // no values: an empty PLAIN page
+                Enc::Dict { dict, ndict, keys } => {
+                    dict_off = file.len();
+                    let mut t = Thrift::new();
+                    page_header(&mut t, 2, dict.len());
+                    t.structf(7);
+                    t.i32f(1, *ndict as i32);
+                    t.i32f(2, 0);
+                    t.end();
+                    t.end();
+                    file.extend_from_slice(&t.b);
+                    file.extend_from_slice(dict);
+                    let mut b = levels;
+                    hybrid_keys(keys, bit_width(ndict.saturating_sub(1) as u32), &mut b);
+                    (b, 8)
+                }
+            };
+            let data_off = file.len();
+            let mut t = Thrift::new();
+            page_header(&mut t, 0, body.len());
+            t.structf(5);
+            t.i32f(1, num_rows as i32);
+            t.i32f(2, enc_id);
+            t.i32f(3, 3);
+            t.i32f(4, 3);
+            t.end();
+            t.end();
+            file.extend_from_slice(&t.b);
+            file.extend_from_slice(&body);
+            meta.push((start, file.len() - start, data_off, dict_off));
+        }
+    }
+    // footer
+    let mut m = Thrift::new();
+    m.begin();
+    m.i32f(1, 1);
+    m.field(2, 9);
+    m.list(12, cols.len() + 1);
+    m.begin();
+    m.binf(4, b"schema");
+    m.i32f(5, cols.len() as i32);
+    m.end();
+    for c in cols {
+        m.begin();
+        m.i32f(1, c.ptype);
+        m.i32f(3, if c.optional { 1 } else { 0 });
+        m.binf(4, c.name.as_bytes());
+        match c.logical {
+            Logical::Str => {
+                m.i32f(6, 0);
+                m.structf(10);
+                m.structf(1);
+                m.end();
+                m.end();
+            }
+            Logical::Date => {
+                m.i32f(6, 6);
+                m.structf(10);
+                m.structf(6);
+                m.end();
+                m.end();
+            }
+            Logical::Plain => {}
+        }
+        m.end();
+    }
+    m.i64f(3, num_rows as i64);
+    m.field(4, 9);
+    if num_rows > 0 {
+        m.list(12, 1);
+        m.begin();
+        m.field(1, 9);
+        m.list(12, cols.len());
+        let mut total = 0i64;
+        for (c, &(start, len, data_off, dict_off)) in cols.iter().zip(&meta) {
+            total += len as i64;
+            let is_dict = dict_off != 0;
+            m.begin();
+            m.i64f(2, start as i64);
+            m.structf(3);
+            m.i32f(1, c.ptype);
+            m.field(2, 9);
+            if is_dict {
+                m.list(5, 3);
+                m.zz(0);
+                m.zz(3);
+                m.zz(8);
+            } else {
+                m.list(5, 2);
+                m.zz(0);
+                m.zz(3);
+            }
+            m.field(3, 9);
+            m.list(8, 1);
+            m.varint(c.name.len() as u64);
+            m.b.extend_from_slice(c.name.as_bytes());
+            m.i32f(4, 0);
+            m.i64f(5, num_rows as i64);
+            m.i64f(6, len as i64);
+            m.i64f(7, len as i64);
+            m.i64f(9, data_off as i64);
+            if is_dict {
+                m.i64f(11, dict_off as i64);
+            }
+            m.end();
+            m.end();
+        }
+        m.i64f(2, total);
+        m.i64f(3, num_rows as i64);
+        m.end();
+    } else {
+        m.list(12, 0);
+    }
+    m.end();
+    let n = m.b.len() as u32;
+    file.extend_from_slice(&m.b);
+    file.extend_from_slice(&n.to_le_bytes());
+    file.extend_from_slice(b"PAR1");
+    std::fs::File::create(path)?.write_all(&file)
+}
+
+/// Dictionary of fixed-width PLAIN values (4 or 8 bytes); None when there are too many distinct.
+pub fn dict_fixed(values: &[u8], w: usize, limit: usize) -> Option<Enc> {
+    let n = values.len() / w;
+    let get = |i: usize| -> u64 {
+        if w == 4 {
+            u32::from_le_bytes(values[4 * i..4 * i + 4].try_into().unwrap()) as u64
+        } else {
+            u64::from_le_bytes(values[8 * i..8 * i + 8].try_into().unwrap())
+        }
+    };
+    let cap = (2 * limit).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut slots: Vec<u32> = vec![u32::MAX; cap];
+    let mut vals: Vec<u64> = Vec::new();
+    let mut keys: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = get(i);
+        let mut h = (x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask;
+        loop {
+            let s = slots[h];
+            if s == u32::MAX {
+                if vals.len() >= limit {
+                    return None;
+                }
+                slots[h] = vals.len() as u32;
+                keys.push(vals.len() as u32);
+                vals.push(x);
+                break;
+            }
+            if vals[s as usize] == x {
+                keys.push(s);
+                break;
+            }
+            h = (h + 1) & mask;
+        }
+    }
+    let mut dict = Vec::with_capacity(vals.len() * w);
+    for &v in &vals {
+        dict.extend_from_slice(&v.to_le_bytes()[..w]);
+    }
+    Some(Enc::Dict { dict, ndict: vals.len(), keys })
+}
+
+/// Dictionary of PLAIN byte arrays (u32 length + bytes) where equal values are adjacent or
+/// repeat from a small set: a key per value, a new entry whenever the value differs from every
+/// entry seen (hash on bytes).
+pub fn dict_bytes(values: &[u8], limit: usize) -> Option<Enc> {
+    let mut map: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+    let mut dict = Vec::new();
+    let mut keys = Vec::new();
+    let mut ndict = 0usize;
+    let mut i = 0usize;
+    let mut last: (&[u8], u32) = (&[], u32::MAX);
+    while i < values.len() {
+        let l = u32::from_le_bytes(values[i..i + 4].try_into().unwrap()) as usize;
+        let s = &values[i + 4..i + 4 + l];
+        i += 4 + l;
+        if last.1 != u32::MAX && last.0 == s {
+            keys.push(last.1);
+            continue;
+        }
+        let k = match map.get(s) {
+            Some(&k) => k,
+            None => {
+                if ndict >= limit {
+                    return None;
+                }
+                let k = ndict as u32;
+                map.insert(s, k);
+                dict.extend_from_slice(&(l as u32).to_le_bytes());
+                dict.extend_from_slice(s);
+                ndict += 1;
+                k
+            }
+        };
+        keys.push(k);
+        last = (s, k);
+    }
+    Some(Enc::Dict { dict, ndict, keys })
+}
+
+/// Rows of one person are adjacent and each person appears once: a new entry on every change.
+pub fn dict_runs(values: &[u8]) -> Enc {
+    let mut dict = Vec::new();
+    let mut keys = Vec::new();
+    let mut ndict = 0usize;
+    let mut i = 0usize;
+    let mut last: &[u8] = &[];
+    while i < values.len() {
+        let l = u32::from_le_bytes(values[i..i + 4].try_into().unwrap()) as usize;
+        let s = &values[i + 4..i + 4 + l];
+        i += 4 + l;
+        if ndict == 0 || s != last {
+            dict.extend_from_slice(&(l as u32).to_le_bytes());
+            dict.extend_from_slice(s);
+            ndict += 1;
+            last = s;
+        }
+        keys.push(ndict as u32 - 1);
+    }
+    Enc::Dict { dict, ndict, keys }
+}

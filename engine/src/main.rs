@@ -1375,16 +1375,27 @@ fn sessions(name: &[u8], evs: &[u64], cls: &[CItem], ctx: &Ctx, win: &mut Win, a
 }
 
 fn write_users(path: &Path, uo: &UserOut) {
-    use pq::{Col, Logical::{Date, Plain, Str}, T_BYTE_ARRAY, T_INT32, T_INT64};
+    // dictionary encodings keep the file small: one name per person, a few distinct days and
+    // counts, a handful of categories. Output bytes cost time even after the process exits.
+    use pq::{DCol, Enc, Logical::{Date, Plain, Str}, T_BYTE_ARRAY, T_INT32, T_INT64};
+    let fixed = |v: &[u8], w: usize, limit: usize| pq::dict_fixed(v, w, limit).unwrap_or_else(|| Enc::Plain(v.to_vec()));
+    let n = uo.rows;
     let cols = [
-        Col { name: "user_id", ptype: T_BYTE_ARRAY, logical: Str, optional: false, defs: None, values: &uo.uid.0 },
-        Col { name: "day", ptype: T_INT32, logical: Date, optional: false, defs: None, values: &uo.day.0 },
-        Col { name: "sessions", ptype: T_INT32, logical: Plain, optional: false, defs: None, values: &uo.ses.0 },
-        Col { name: "events", ptype: T_INT32, logical: Plain, optional: false, defs: None, values: &uo.evn.0 },
-        Col { name: "revenue_cents", ptype: T_INT64, logical: Plain, optional: false, defs: None, values: &uo.rev.0 },
-        Col { name: "top_category", ptype: T_BYTE_ARRAY, logical: Str, optional: true, defs: Some(&uo.topd), values: &uo.topv.0 },
+        DCol { name: "user_id", ptype: T_BYTE_ARRAY, logical: Str, optional: false, defs: None, enc: pq::dict_runs(&uo.uid.0) },
+        DCol { name: "day", ptype: T_INT32, logical: Date, optional: false, defs: None, enc: fixed(&uo.day.0, 4, 1 << 16) },
+        DCol { name: "sessions", ptype: T_INT32, logical: Plain, optional: false, defs: None, enc: fixed(&uo.ses.0, 4, 1 << 12) },
+        DCol { name: "events", ptype: T_INT32, logical: Plain, optional: false, defs: None, enc: fixed(&uo.evn.0, 4, 1 << 14) },
+        DCol { name: "revenue_cents", ptype: T_INT64, logical: Plain, optional: false, defs: None, enc: fixed(&uo.rev.0, 8, (n / 3).max(1024)) },
+        DCol {
+            name: "top_category",
+            ptype: T_BYTE_ARRAY,
+            logical: Str,
+            optional: true,
+            defs: Some(&uo.topd),
+            enc: pq::dict_bytes(&uo.topv.0, 1 << 12).unwrap_or_else(|| Enc::Plain(uo.topv.0.clone())),
+        },
     ];
-    pq::write(path, uo.rows, &cols).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
+    pq::write_dict(path, n, &cols).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
 }
 
 #[allow(dead_code)]

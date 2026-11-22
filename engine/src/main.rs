@@ -374,6 +374,44 @@ struct EvRec {
     _p: u32,
 }
 
+/// Dedup slots, a cache line of four: event IDs, then the kept copy of each.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct DLine {
+    k: [u64; 4],
+    p: [*const EvRec; 4],
+}
+
+impl DLine {
+    /// Bit masks of the slots holding `k` and of the empty slots.
+    #[inline(always)]
+    fn find(&self, k: u64) -> (u32, u32) {
+        find4(&self.k, k)
+    }
+}
+
+/// Bit masks of the four keys equal to `k` and of those that are EMPTY.
+#[inline(always)]
+fn find4(keys: &[u64; 4], k: u64) -> (u32, u32) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let kv = _mm256_loadu_si256(keys.as_ptr() as *const __m256i);
+        let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, _mm256_set1_epi64x(k as i64)))) as u32;
+        let em = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, _mm256_set1_epi64x(EMPTY as i64)))) as u32;
+        (eq, em)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let (mut eq, mut em) = (0u32, 0u32);
+        for j in 0..4 {
+            eq |= ((keys[j] == k) as u32) << j;
+            em |= ((keys[j] == EMPTY) as u32) << j;
+        }
+        (eq, em)
+    }
+}
+
 /// What empty dedup slots point at: an invalid copy, so scans need no emptiness test.
 static NO_EVENT: EvRec = EvRec { eid: EMPTY, user: 0, ing: u32::MAX, ts: u32::MAX, pc: 0, _p: 0 };
 
@@ -757,7 +795,7 @@ fn dedup_bucket(
     ev: &[part::Parts<EvRec>],
     links: &LinkTab,
     shift: u32,
-    table: &mut Vec<(u64, *const EvRec)>,
+    table: &mut Vec<DLine>,
     win: &mut Vec<PRec>,
     out: &mut part::Parts<PRec>,
     fp: Option<(&fast::Fast, &fast::PTab)>,
@@ -768,10 +806,11 @@ fn dedup_bucket(
     if n == 0 {
         return;
     }
-    let cap = (n + n / 2).next_power_of_two();
-    let mask = cap - 1;
+    let nl = (n * 10 / 24 + 1).next_power_of_two().max(2); // lines of four slots, at most 60% full
+    let mask = nl - 1;
+    let cap = nl * 4;
     table.clear();
-    table.resize(cap, (EMPTY, &NO_EVENT as *const EvRec));
+    table.resize(nl, DLine { k: [EMPTY; 4], p: [&NO_EVENT as *const EvRec; 4] });
 prof!(2, {
     for t in ev {
       let (v1, v2) = t.get(b);
@@ -782,15 +821,19 @@ prof!(2, {
             }
             let mut i = (ids::mix(r.eid) as usize) & mask;
             loop {
-                let s = unsafe { table.get_unchecked_mut(i) };
-                if s.0 == EMPTY {
-                    *s = (r.eid, r as *const EvRec);
+                let l = unsafe { table.get_unchecked_mut(i) };
+                let (eq, em) = l.find(r.eid);
+                if eq != 0 {
+                    let j = eq.trailing_zeros() as usize;
+                    if r.ing < unsafe { (*l.p[j]).ing } {
+                        l.p[j] = r as *const EvRec;
+                    }
                     break;
                 }
-                if s.0 == r.eid {
-                    if r.ing < unsafe { (*s.1).ing } {
-                        s.1 = r as *const EvRec;
-                    }
+                if em != 0 {
+                    let j = em.trailing_zeros() as usize;
+                    l.k[j] = r.eid;
+                    l.p[j] = r as *const EvRec;
                     break;
                 }
                 i = (i + 1) & mask;
@@ -805,18 +848,17 @@ prof!(2, {
         win.reserve(cap);
         let w = win.as_mut_ptr();
         let mut n = 0usize;
-        for s in table.iter() {
-            let r = unsafe { &*s.1 };
-            unsafe { w.add(n).write(PRec { pk: r.user, ts: r.ts, pc: r.pc }) };
-            n += (r.ts != u32::MAX) as usize;
+        for l in table.iter() {
+            for &p in &l.p {
+                let r = unsafe { &*p };
+                unsafe { w.add(n).write(PRec { pk: r.user, ts: r.ts, pc: r.pc }) };
+                n += (r.ts != u32::MAX) as usize;
+            }
         }
         unsafe { win.set_len(n) };
     } else {
-    for s in table.iter() {
-        if s.0 == EMPTY {
-            continue;
-        }
-        let r = unsafe { &*s.1 };
+    for &p in table.iter().flat_map(|l| l.p.iter()) {
+        let r = unsafe { &*p };
         if r.ts == u32::MAX {
             continue;
         }

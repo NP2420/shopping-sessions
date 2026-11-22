@@ -1523,6 +1523,21 @@ fn main() {
     let ev_files: Vec<&'static [u8]> = csv_files(&data.join("events")).iter().map(|p| map_file(p)).collect();
     let cl_files: Vec<&'static [u8]> = csv_files(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let ln_files: Vec<&'static [u8]> = csv_files(&data.join("links")).iter().map(|p| map_file(p)).collect();
+    // ask the kernel to read every input ahead, in parse order, from a thread of its own: free
+    // when the files are cached, and parsing no longer waits on each page when they are not
+    {
+        let order: Vec<&'static [u8]> = ln_files.iter().chain(ev_files.iter()).chain(cl_files.iter()).copied().collect();
+        std::thread::spawn(move || {
+            for d in order {
+                let mut o = 0usize;
+                while o < d.len() {
+                    let n = (d.len() - o).min(8 << 20);
+                    unsafe { libc::madvise(d.as_ptr().add(o) as *mut libc::c_void, n, libc::MADV_WILLNEED) };
+                    o += n;
+                }
+            }
+        });
+    }
     let ev_bytes: usize = ev_files.iter().map(|d| d.len()).sum();
     if let Ok(mode) = std::env::var("SS_BENCH") {
         bench(&mode, &ev_files, &ctx);

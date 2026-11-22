@@ -1134,7 +1134,7 @@ fn sessions(name: &[u8], evs: &[u64], cls: &[CItem], ctx: &Ctx, win: &mut Win, a
     win.active.clear();
 }
 
-fn user_cols(uo: &UserOut) -> Vec<u8> {
+fn write_users(path: &Path, uo: &UserOut) {
     use pq::{Col, Logical::{Date, Plain, Str}, T_BYTE_ARRAY, T_INT32, T_INT64};
     let cols = [
         Col { name: "user_id", ptype: T_BYTE_ARRAY, logical: Str, optional: false, defs: None, values: &uo.uid.0 },
@@ -1144,9 +1144,10 @@ fn user_cols(uo: &UserOut) -> Vec<u8> {
         Col { name: "revenue_cents", ptype: T_INT64, logical: Plain, optional: false, defs: None, values: &uo.rev.0 },
         Col { name: "top_category", ptype: T_BYTE_ARRAY, logical: Str, optional: true, defs: Some(&uo.topd), values: &uo.topv.0 },
     ];
-    pq::encode(uo.rows, &cols)
+    pq::write(path, uo.rows, &cols).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
 }
 
+#[allow(dead_code)]
 fn write_file(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
 }
@@ -1534,7 +1535,7 @@ fn main() {
                         person_bucket(order[i].1, pev, pcl, ctx, pool, &mut w, &mut acc, &mut uo);
                     }
                     if uo.rows > 0 || t == 0 {
-                        write_file(&ud.join(format!("part-{t:03}.parquet")), &user_cols(&uo));
+                        write_users(&ud.join(format!("part-{t:03}.parquet")), &uo);
                     }
                     acc
                 })
@@ -1595,7 +1596,8 @@ fn main() {
             Col { name: "revenue_cents", ptype: T_INT64, logical: Plain, optional: false, defs: None, values: &rev.0 },
             Col { name: "assisted_sessions", ptype: T_INT32, logical: Plain, optional: false, defs: None, values: &ass.0 },
         ];
-        write_file(&cd.join("part-000.parquet"), &pq::encode(rows, &cols));
+        let path = cd.join("part-000.parquet");
+        pq::write(&path, rows, &cols).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
     }
     lap("campaign_daily written");
     unsafe { libc::_exit(0) }

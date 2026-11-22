@@ -111,6 +111,155 @@ fn def_levels(defs: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&body);
 }
 
+/// Writes the file with one vectored write of small headers and the column buffers themselves.
+pub fn write(path: &std::path::Path, num_rows: usize, cols: &[Col]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut heads: Vec<Vec<u8>> = Vec::with_capacity(cols.len() + 2);
+    let mut offs = Vec::with_capacity(cols.len());
+    let mut off = 4usize;
+    if num_rows > 0 {
+        for c in cols {
+            let mut h = Vec::new();
+            let mut levels = Vec::new();
+            if c.optional {
+                def_levels(c.defs.expect("optional column needs defs"), &mut levels);
+            }
+            let page_len = levels.len() + c.values.len();
+            let mut t = Thrift::new();
+            t.begin();
+            t.i32f(1, 0);
+            t.i32f(2, page_len as i32);
+            t.i32f(3, page_len as i32);
+            t.structf(5);
+            t.i32f(1, num_rows as i32);
+            t.i32f(2, 0);
+            t.i32f(3, 3);
+            t.i32f(4, 3);
+            t.end();
+            t.end();
+            h.extend_from_slice(&t.b);
+            h.extend_from_slice(&levels);
+            offs.push((off, h.len() + c.values.len()));
+            off += h.len() + c.values.len();
+            heads.push(h);
+        }
+    }
+    let meta = footer(num_rows, cols, &offs);
+    let mut f = std::fs::File::create(path)?;
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(2 * cols.len() + 2);
+    parts.push(b"PAR1");
+    if num_rows > 0 {
+        for (h, c) in heads.iter().zip(cols) {
+            parts.push(h);
+            parts.push(c.values);
+        }
+    }
+    parts.push(&meta);
+    let mut i = 0;
+    let mut skip = 0usize;
+    while i < parts.len() {
+        let mut v: Vec<std::io::IoSlice> = Vec::with_capacity(parts.len() - i);
+        v.push(std::io::IoSlice::new(&parts[i][skip..]));
+        for p in &parts[i + 1..] {
+            v.push(std::io::IoSlice::new(p));
+        }
+        let mut n = f.write_vectored(&v)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write"));
+        }
+        // advance past what was written
+        while i < parts.len() && n >= parts[i].len() - skip {
+            n -= parts[i].len() - skip;
+            i += 1;
+            skip = 0;
+        }
+        if i < parts.len() {
+            skip += n;
+        }
+    }
+    Ok(())
+}
+
+/// Footer: metadata, its length, magic. `offs` holds each column chunk's (offset, size).
+fn footer(num_rows: usize, cols: &[Col], offs: &[(usize, usize)]) -> Vec<u8> {
+    let mut m = Thrift::new();
+    m.begin();
+    m.i32f(1, 1);
+    m.field(2, 9);
+    m.list(12, cols.len() + 1);
+    m.begin();
+    m.binf(4, b"schema");
+    m.i32f(5, cols.len() as i32);
+    m.end();
+    for c in cols {
+        m.begin();
+        m.i32f(1, c.ptype);
+        m.i32f(3, if c.optional { 1 } else { 0 });
+        m.binf(4, c.name.as_bytes());
+        match c.logical {
+            Logical::Str => {
+                m.i32f(6, 0);
+                m.structf(10);
+                m.structf(1);
+                m.end();
+                m.end();
+            }
+            Logical::Date => {
+                m.i32f(6, 6);
+                m.structf(10);
+                m.structf(6);
+                m.end();
+                m.end();
+            }
+            Logical::Plain => {}
+        }
+        m.end();
+    }
+    m.i64f(3, num_rows as i64);
+    m.field(4, 9);
+    if num_rows > 0 {
+        m.list(12, 1);
+        m.begin();
+        m.field(1, 9);
+        m.list(12, cols.len());
+        let mut total = 0i64;
+        for (c, &(off, len)) in cols.iter().zip(offs) {
+            total += len as i64;
+            m.begin();
+            m.i64f(2, off as i64);
+            m.structf(3);
+            m.i32f(1, c.ptype);
+            m.field(2, 9);
+            m.list(5, 2);
+            m.zz(0);
+            m.zz(3);
+            m.field(3, 9);
+            m.list(8, 1);
+            m.varint(c.name.len() as u64);
+            m.b.extend_from_slice(c.name.as_bytes());
+            m.i32f(4, 0);
+            m.i64f(5, num_rows as i64);
+            m.i64f(6, len as i64);
+            m.i64f(7, len as i64);
+            m.i64f(9, off as i64);
+            m.end();
+            m.end();
+        }
+        m.i64f(2, total);
+        m.i64f(3, num_rows as i64);
+        m.end();
+    } else {
+        m.list(12, 0);
+    }
+    m.end();
+    let mut out = m.b;
+    let n = out.len() as u32;
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(b"PAR1");
+    out
+}
+
+#[allow(dead_code)]
 pub fn encode(num_rows: usize, cols: &[Col]) -> Vec<u8> {
     let mut est = 64;
     for c in cols {

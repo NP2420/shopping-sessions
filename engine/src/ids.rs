@@ -7,6 +7,8 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AO};
+use std::sync::Mutex;
 
 pub const OVF: u64 = 1 << 63;
 pub const EMPTY: u64 = u64::MAX; // never a valid key: overflow keys keep bit 62 clear
@@ -137,16 +139,16 @@ pub fn hash_bytes(s: &[u8]) -> u64 {
     h ^ (h >> 32)
 }
 
-/// Key for a non-empty ID. Overflow IDs are pushed to `ovf` so their bytes can be found later.
+/// Key for a non-empty user ID. Overflow IDs go into `pool` (a concurrent table) so their
+/// bytes can be found later.
 #[inline(always)]
-pub fn key(s: &[u8], ovf: &mut Vec<(u64, &'static [u8])>) -> u64 {
+pub fn key(s: &[u8], pool: &Pool) -> u64 {
     match pack(s) {
         Some(k) => k,
         None => {
             let k = OVF | (hash_bytes(s) >> 2);
             // SAFETY of 'static: every input slice points into a mapping that lives until exit.
-            let st: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s) };
-            ovf.push((k, st));
+            pool.insert(k, unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s) });
             k
         }
     }
@@ -161,6 +163,66 @@ pub fn ident(s: &[u8]) -> u64 {
     }
 }
 
+/// Order-only key (click IDs: copies of a click are identical, so only their order matters).
+/// Short IDs pack as usual; longer ones keep a pointer to their bytes and length: bit 63, then
+/// 15 bits of length (all ones: the pointer is to a leaked slice), then the 48-bit address.
+#[inline(always)]
+pub fn okey(s: &[u8]) -> u64 {
+    match pack(s) {
+        Some(k) => k,
+        None => {
+            let st: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s) };
+            if s.len() < 0x7FFF {
+                OVF | ((s.len() as u64) << 48) | (st.as_ptr() as u64)
+            } else {
+                let b: &'static &'static [u8] = Box::leak(Box::new(st));
+                OVF | (0x7FFFu64 << 48) | (b as *const &'static [u8] as u64)
+            }
+        }
+    }
+}
+
+#[inline]
+fn okey_bytes(k: u64) -> &'static [u8] {
+    let n = ((k >> 48) & 0x7FFF) as usize;
+    let p = (k & ((1u64 << 48) - 1)) as usize;
+    unsafe {
+        if n == 0x7FFF {
+            *(p as *const &'static [u8])
+        } else {
+            std::slice::from_raw_parts(p as *const u8, n)
+        }
+    }
+}
+
+#[inline]
+fn short_bytes(k: u64, buf: &mut [u8; 10]) -> usize {
+    let mut n = 0;
+    let mut sh = 54i32;
+    while sh >= 0 {
+        let c = ((k >> sh) & 63) as usize;
+        if c == 0 {
+            break;
+        }
+        buf[n] = DECODE[c];
+        n += 1;
+        sh -= 6;
+    }
+    n
+}
+
+/// Byte order of two order-only keys.
+#[inline]
+pub fn ocmp(a: u64, b: u64) -> Ordering {
+    if (a | b) & OVF == 0 {
+        return a.cmp(&b);
+    }
+    let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+    let xa: &[u8] = if a & OVF != 0 { okey_bytes(a) } else { let n = short_bytes(a, &mut x); &x[..n] };
+    let yb: &[u8] = if b & OVF != 0 { okey_bytes(b) } else { let n = short_bytes(b, &mut y); &y[..n] };
+    xa.cmp(yb)
+}
+
 #[inline(always)]
 pub fn mix(k: u64) -> u64 {
     let mut x = k ^ (k >> 31);
@@ -170,33 +232,103 @@ pub fn mix(k: u64) -> u64 {
     x ^ (x >> 33)
 }
 
-pub type Pool = HashMap<u64, &'static [u8]>;
+/// Bytes of overflow user IDs by key: an open-addressing table filled concurrently while the
+/// inputs are parsed and read only after. Key 0 marks a free slot (overflow keys have bit 63).
+/// The value packs the address with the length in the top 16 bits (all ones: the address is
+/// of a leaked slice). A key that finds no slot within `PROBES` goes to a locked side map.
+pub struct Pool {
+    slots: Vec<u64>, // [key, value] pairs, zeroed on allocation
+    mask: usize,
+    spill: Mutex<HashMap<u64, &'static [u8]>>,
+}
+
+const PROBES: usize = 64;
+
+impl Pool {
+    pub fn new(want: usize) -> Pool {
+        let cap = want.next_power_of_two().max(1 << 12);
+        Pool { slots: vec![0u64; 2 * cap], mask: cap - 1, spill: Mutex::new(HashMap::new()) }
+    }
+    #[inline(always)]
+    fn at(&self, i: usize) -> (&AtomicU64, &AtomicU64) {
+        unsafe {
+            let p = self.slots.as_ptr().add(2 * i) as *const AtomicU64;
+            (&*p, &*p.add(1))
+        }
+    }
+    #[inline]
+    pub fn insert(&self, k: u64, s: &'static [u8]) {
+        let mut i = mix(k) as usize & self.mask;
+        for _ in 0..PROBES {
+            let (ks, vs) = self.at(i);
+            let cur = ks.load(AO::Relaxed);
+            if cur == k {
+                return;
+            }
+            if cur == 0 {
+                match ks.compare_exchange(0, k, AO::Relaxed, AO::Relaxed) {
+                    Ok(_) => {
+                        let v = if s.len() < 0xFFFF {
+                            ((s.len() as u64) << 48) | s.as_ptr() as u64
+                        } else {
+                            let b: &'static &'static [u8] = Box::leak(Box::new(s));
+                            (0xFFFFu64 << 48) | (b as *const &'static [u8] as u64)
+                        };
+                        vs.store(v, AO::Relaxed);
+                        return;
+                    }
+                    Err(x) if x == k => return,
+                    Err(_) => {}
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+        self.spill.lock().unwrap().insert(k, s);
+    }
+    pub fn get(&self, k: u64) -> Option<&'static [u8]> {
+        let mut i = mix(k) as usize & self.mask;
+        for _ in 0..PROBES {
+            let (ks, vs) = self.at(i);
+            let cur = ks.load(AO::Relaxed);
+            if cur == k {
+                let v = vs.load(AO::Relaxed);
+                let n = (v >> 48) as usize;
+                let p = (v & ((1u64 << 48) - 1)) as usize;
+                return Some(unsafe {
+                    if n == 0xFFFF {
+                        *(p as *const &'static [u8])
+                    } else {
+                        std::slice::from_raw_parts(p as *const u8, n)
+                    }
+                });
+            }
+            if cur == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+        self.spill.lock().unwrap().get(&k).copied()
+    }
+}
 
 pub fn decode_into(k: u64, pool: &Pool, out: &mut Vec<u8>) {
     if k & OVF != 0 {
-        out.extend_from_slice(pool.get(&k).expect("overflow id without bytes"));
+        out.extend_from_slice(pool.get(k).expect("overflow id without bytes"));
         return;
     }
-    let mut sh = 54i32;
-    while sh >= 0 {
-        let c = ((k >> sh) & 63) as usize;
-        if c == 0 {
-            break;
-        }
-        out.push(DECODE[c]);
-        sh -= 6;
-    }
+    let mut b = [0u8; 10];
+    let n = short_bytes(k, &mut b);
+    out.extend_from_slice(&b[..n]);
 }
 
 pub fn cmp_keys(a: u64, b: u64, pool: &Pool) -> Ordering {
     if (a | b) & OVF == 0 {
         return a.cmp(&b);
     }
-    let mut x = Vec::with_capacity(16);
-    let mut y = Vec::with_capacity(16);
-    decode_into(a, pool, &mut x);
-    decode_into(b, pool, &mut y);
-    x.cmp(&y)
+    let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+    let xa: &[u8] = if a & OVF != 0 { pool.get(a).expect("overflow id without bytes") } else { let n = short_bytes(a, &mut x); &x[..n] };
+    let yb: &[u8] = if b & OVF != 0 { pool.get(b).expect("overflow id without bytes") } else { let n = short_bytes(b, &mut y); &y[..n] };
+    xa.cmp(yb)
 }
 
 #[cfg(test)]
@@ -208,7 +340,7 @@ mod tests {
         for w in words.windows(2) {
             assert!(pack(w[0]).unwrap() < pack(w[1]).unwrap(), "{:?}", w);
         }
-        let pool = Pool::default();
+        let pool = Pool::new(16);
         let mut v = Vec::new();
         decode_into(pack(b"u1aZ_9").unwrap(), &pool, &mut v);
         assert_eq!(v, b"u1aZ_9");

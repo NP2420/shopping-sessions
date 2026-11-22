@@ -602,7 +602,7 @@ pub fn pass_b(
                     if (x.ck | y.ck) & OVF == 0 {
                         y.ck.cmp(&x.ck)
                     } else {
-                        ids::cmp_keys(y.ck, x.ck, pool)
+                        ids::ocmp(y.ck, x.ck)
                     }
                 })
             });

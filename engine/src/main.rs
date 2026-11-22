@@ -381,7 +381,6 @@ fn bucket(k: u64, shift: u32) -> usize {
     (ids::mix(k) >> shift) as usize
 }
 
-type Ovf = Vec<(u64, &'static [u8])>;
 
 #[inline(always)]
 fn parse_price(p: &[u8]) -> Option<u32> {
@@ -406,7 +405,7 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &mut Ovf, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FRec>) {
+fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &Pool, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FRec>) {
     parse_events_g::<true>(c, ctx, shift, out, ovf, fa, fout)
 }
 
@@ -416,7 +415,7 @@ fn parse_events_g<const PUSH: bool>(
     ctx: &Ctx,
     shift: u32,
     out: &mut part::Parts<EvRec>,
-    ovf: &mut Ovf,
+    ovf: &Pool,
     fa: Option<&fast::Fast>,
     fout: &mut part::Parts<fast::FRec>,
 ) {
@@ -496,7 +495,7 @@ fn event_type(t: &[u8]) -> u32 {
     vc as u32 | ((pu as u32) << 1)
 }
 
-fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
+fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &Pool) {
     scan::lines3::<2>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -509,7 +508,7 @@ fn parse_links(c: Chunk, edges: &mut Vec<(u64, u64)>, ovf: &mut Ovf) {
 
 /// Clicks: dense users go straight to the fast path's person partitions; the rest keep their
 /// user key in `tmp` until the links are known (see `resolve_clicks`).
-fn parse_clicks(c: Chunk, ctx: &Ctx, ovf: &mut Ovf, tmp: &mut Vec<CRec>, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FClk>) {
+fn parse_clicks(c: Chunk, ctx: &Ctx, ovf: &Pool, tmp: &mut Vec<CRec>, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FClk>) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     let mut dates = ts::Dates::new();
@@ -525,7 +524,7 @@ fn parse_clicks(c: Chunk, ctx: &Ctx, ovf: &mut Ovf, tmp: &mut Vec<CRec>, fa: Opt
         if !(tok & (t >= lo) & (t < hi)) {
             return;
         }
-        let ck = ids::key(f[0], ovf);
+        let ck = ids::okey(f[0]);
         if let Some(fa) = fa {
             if let Some(n) = fa.user_number(f[1]) {
                 let p = (n >> gen::ALIAS_BITS) as u32;
@@ -1002,7 +1001,7 @@ fn person_bucket(
                     if (x.ck | y.ck) & OVF == 0 {
                         y.ck.cmp(&x.ck)
                     } else {
-                        ids::cmp_keys(y.ck, x.ck, pool)
+                        ids::ocmp(y.ck, x.ck)
                     }
                 })
             });
@@ -1173,7 +1172,7 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
     for _ in 0..reps {
     let t = std::time::Instant::now();
     lines = 0;
-    let mut o = Ovf::new();
+    let o = Pool::new(1 << 20);
     let mut b = part::Parts::<EvRec>::new(512, 50_000);
     let mut fdummy = part::Parts::<fast::FRec>::new(1, 4);
     let fk = recover_keys(files).map(|k| fast::Fast::new(k, files.iter().map(|d| d.len()).sum()));
@@ -1204,7 +1203,7 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
             "ids" => scan::lines::<7>(d, 0, d.len(), |f| {
                 lines += 1;
                 if !f[0].is_empty() && !f[1].is_empty() {
-                    sum = sum.wrapping_add(ids::ident(f[0]) ^ ids::key(f[1], &mut o));
+                    sum = sum.wrapping_add(ids::ident(f[0]) ^ ids::key(f[1], &o));
                 }
             }),
             "prod" => scan::lines::<7>(d, 0, d.len(), |f| {
@@ -1212,14 +1211,14 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
                 sum = sum.wrapping_add(ctx.cat_of(f[5]) as u64 + parse_price(f[6]).unwrap_or(0) as u64 + (f[4] == b"view") as u64);
             }),
             "nopush" => {
-                parse_events_g::<false>(c, ctx, 64 - 9, &mut b, &mut o, None, &mut fdummy);
+                parse_events_g::<false>(c, ctx, 64 - 9, &mut b, &o, None, &mut fdummy);
                 lines += 1;
             }
             "fparse" => {
-                parse_events(c, ctx, 64 - 9, &mut b, &mut o, fk.as_ref(), &mut fb);
+                parse_events(c, ctx, 64 - 9, &mut b, &o, fk.as_ref(), &mut fb);
             }
             "parse" => {
-                parse_events(c, ctx, 64 - 9, &mut b, &mut o, None, &mut fdummy);
+                parse_events(c, ctx, 64 - 9, &mut b, &o, None, &mut fdummy);
             }
             _ => {}
         }
@@ -1293,7 +1292,7 @@ fn main() {
     let cl_chunks = chunks_of(&cl_files, csize);
     let ln_chunks = chunks_of(&ln_files, csize);
     let est_events = ev_bytes / 80 + 1;
-    let nb = (est_events / 40_000).next_power_of_two().clamp(64, 2048);
+    let nb = std::env::var("SS_NB").ok().and_then(|v| v.parse().ok()).unwrap_or((est_events / 40_000).next_power_of_two().clamp(64, 2048));
     let shift = 64 - nb.trailing_zeros();
     let per = est_events / nt / nb * 5 / 4 + 32;
     lap("setup");
@@ -1301,32 +1300,28 @@ fn main() {
     // L: links, with the generator-key search on its own thread (SS_GENERIC=1 turns it off)
     let next = AtomicUsize::new(0);
     let want_keys = std::env::var_os("SS_GENERIC").is_none();
-    let (link_parts, keys): (Vec<(Vec<(u64, u64)>, Ovf)>, Option<gen::Keys>) = std::thread::scope(|s| {
+    let pool = Pool::new(ev_bytes / 2048);
+    let (link_parts, keys): (Vec<Vec<(u64, u64)>>, Option<gen::Keys>) = std::thread::scope(|s| {
         let kh = s.spawn(|| if want_keys { recover_keys(&ev_files) } else { None });
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
                     let mut e = Vec::new();
-                    let mut o = Ovf::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= ln_chunks.len() {
                             break;
                         }
-                        parse_links(ln_chunks[i], &mut e, &mut o);
+                        parse_links(ln_chunks[i], &mut e, &pool);
                     }
-                    (e, o)
+                    e
                 })
             })
             .collect();
         let parts = hs.into_iter().map(|h| h.join().unwrap()).collect();
         (parts, kh.join().unwrap())
     });
-    let mut pool = Pool::default();
-    for (_, o) in &link_parts {
-        pool.extend(o.iter().copied());
-    }
-    let edges: Vec<Vec<(u64, u64)>> = link_parts.into_iter().map(|(e, _)| e).collect();
+    let edges: Vec<Vec<(u64, u64)>> = link_parts;
     lap("links parsed");
 
     // keys of the generator, for the dense-ID fast path (SS_GENERIC=1 turns it off)
@@ -1345,7 +1340,7 @@ fn main() {
     let fcper = fa.map_or(4, |f| cl_bytes / 48 / nt / f.ncb * 3 / 2 + 64);
     let ne_tasks = ev_chunks.len() + cl_chunks.len();
     #[allow(clippy::type_complexity)]
-    let (ev_parts, (links, ptab)): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, part::Parts<fast::FClk>, Vec<CRec>, Ovf)>, (LinkTab, Option<fast::PTab>)) = std::thread::scope(|s| {
+    let (ev_parts, (links, ptab)): (Vec<(part::Parts<EvRec>, part::Parts<fast::FRec>, part::Parts<fast::FClk>, Vec<CRec>)>, (LinkTab, Option<fast::PTab>)) = std::thread::scope(|s| {
         let uf = s.spawn(|| {
             let t = std::time::Instant::now();
             let r = build_links(&edges, &pool, fa);
@@ -1361,22 +1356,22 @@ fn main() {
                     let mut fb = part::Parts::<fast::FRec>::new(nib.max(1), fper);
                     let mut fc = part::Parts::<fast::FClk>::new(ncb, fcper);
                     let mut ct = Vec::new();
-                    let mut o = Ovf::new();
+                    let o = &pool;
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= ne_tasks {
                             break;
                         }
                         if i < ev_chunks.len() {
-                            parse_events(ev_chunks[i], &ctx, shift, &mut b, &mut o, fa, &mut fb);
+                            parse_events(ev_chunks[i], &ctx, shift, &mut b, o, fa, &mut fb);
                         } else {
-                            parse_clicks(cl_chunks[i - ev_chunks.len()], &ctx, &mut o, &mut ct, fa, &mut fc);
+                            parse_clicks(cl_chunks[i - ev_chunks.len()], &ctx, o, &mut ct, fa, &mut fc);
                         }
                     }
                     b.finish();
                     fb.finish();
                     fc.finish();
-                    (b, fb, fc, ct, o)
+                    (b, fb, fc, ct)
                 })
             })
             .collect();
@@ -1384,14 +1379,11 @@ fn main() {
         (parts, uf.join().unwrap())
     });
     lap("events parsed + union-find");
-    for (_, _, _, _, o) in &ev_parts {
-        pool.extend(o.iter().copied());
-    }
     let mut ev: Vec<part::Parts<EvRec>> = Vec::with_capacity(nt);
     let mut fev: Vec<part::Parts<fast::FRec>> = Vec::with_capacity(nt);
     let mut fcl: Vec<part::Parts<fast::FClk>> = Vec::with_capacity(nt);
     let mut ctmp: Vec<Vec<CRec>> = Vec::with_capacity(nt);
-    for (a, b, c, d, _) in ev_parts {
+    for (a, b, c, d) in ev_parts {
         ev.push(a);
         fev.push(b);
         fcl.push(c);

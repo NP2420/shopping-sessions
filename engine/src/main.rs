@@ -462,8 +462,8 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &Pool, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FRec>) {
-    parse_events_g::<true>(c, ctx, shift, out, ovf, fa, fout)
+fn parse_events(c: Chunk, ctx: &Ctx, shift: u32, out: &mut part::Parts<EvRec>, ovf: &Pool, fa: Option<&fast::Fast>, fout: &mut part::Parts<fast::FRec>, lt: Option<&LinkTab>) {
+    parse_events_g::<true>(c, ctx, shift, out, ovf, fa, fout, lt)
 }
 
 #[inline(always)]
@@ -475,10 +475,16 @@ fn parse_events_g<const PUSH: bool>(
     ovf: &Pool,
     fa: Option<&fast::Fast>,
     fout: &mut part::Parts<fast::FRec>,
+    lt: Option<&LinkTab>,
 ) {
     let ws = ctx.ws;
     let we = ctx.we;
     let mut dates = ts::Dates::new();
+    // with the link table ready, valid copies carry their person (marked by _p = 1); the
+    // lookup happens 8 valid lines after its prefetch
+    const RING: usize = 8;
+    let mut ring = [EvRec { eid: 0, user: 0, ing: 0, ts: 0, pc: 0, _p: 0 }; RING];
+    let mut rn = 0usize;
     scan::lines3::<7>(c.data, c.start, c.end, |f| {
         if f[0].is_empty() {
             return;
@@ -521,15 +527,38 @@ fn parse_events_g<const PUSH: bool>(
         if valid {
             user = ids::key(f[1], ovf);
             tsr = (t - ws) as u32;
-            pc = (price << 8) | ctx.cat_of(f[5]) as u32;
+            // the category only counts for purchases (top_category sums purchase prices)
+            pc = if price > 0 { (price << 8) | ctx.cat_of(f[5]) as u32 } else { 0 };
         }
         let r = EvRec { eid, user, ing, ts: tsr, pc, _p: 0 };
         if PUSH {
-            out.push(bucket(eid, shift), r);
+            match lt {
+                Some(lt) if user != 0 => {
+                    lt.prefetch(user);
+                    let slot = &mut ring[rn % RING];
+                    if rn >= RING {
+                        let mut o = *slot;
+                        o.user = lt.get(o.user);
+                        o._p = 1;
+                        out.push(bucket(o.eid, shift), o);
+                    }
+                    *slot = r;
+                    rn += 1;
+                }
+                _ => out.push(bucket(eid, shift), r),
+            }
         } else {
             std::hint::black_box(r);
         }
     });
+    if let Some(lt) = lt {
+        for k in rn.saturating_sub(RING)..rn {
+            let mut o = ring[k % RING];
+            o.user = lt.get(o.user);
+            o._p = 1;
+            out.push(bucket(o.eid, shift), o);
+        }
+    }
 }
 
 /// 1 for `view` or `cart`, 2 for `purchase`, 0 for anything else.
@@ -845,17 +874,30 @@ prof!(2, {
 });prof!(3, {
     win.clear();
     if fp.is_none() {
-        win.reserve(cap);
+        // copies that still need their person go to the front, resolved ones to the back
+        win.reserve(cap + 1);
         let w = win.as_mut_ptr();
         let mut n = 0usize;
+        let mut m = cap;
         for l in table.iter() {
             for &p in &l.p {
                 let r = unsafe { &*p };
-                unsafe { w.add(n).write(PRec { pk: r.user, ts: r.ts, pc: r.pc }) };
-                n += (r.ts != u32::MAX) as usize;
+                let x = PRec { pk: r.user, ts: r.ts, pc: r.pc };
+                let ok = r.ts != u32::MAX;
+                let res = r._p != 0;
+                unsafe {
+                    w.add(n).write(x);
+                    w.add(m).write(x);
+                }
+                n += (ok & !res) as usize;
+                m -= (ok & res) as usize;
             }
         }
         unsafe { win.set_len(n) };
+        let done = unsafe { std::slice::from_raw_parts(w.add(m + 1), cap - m) };
+        for r in done {
+            out.push(bucket(r.pk, shift), *r);
+        }
     } else {
     for &p in table.iter().flat_map(|l| l.p.iter()) {
         let r = unsafe { &*p };
@@ -1410,14 +1452,14 @@ fn bench(mode: &str, files: &[&'static [u8]], ctx: &Ctx) -> ! {
                 sum = sum.wrapping_add(ctx.cat_of(f[5]) as u64 + parse_price(f[6]).unwrap_or(0) as u64 + (f[4] == b"view") as u64);
             }),
             "nopush" => {
-                parse_events_g::<false>(c, ctx, 64 - 9, &mut b, &o, None, &mut fdummy);
+                parse_events_g::<false>(c, ctx, 64 - 9, &mut b, &o, None, &mut fdummy, None);
                 lines += 1;
             }
             "fparse" => {
-                parse_events(c, ctx, 64 - 9, &mut b, &o, fk.as_ref(), &mut fb);
+                parse_events(c, ctx, 64 - 9, &mut b, &o, fk.as_ref(), &mut fb, None);
             }
             "parse" => {
-                parse_events(c, ctx, 64 - 9, &mut b, &o, None, &mut fdummy);
+                parse_events(c, ctx, 64 - 9, &mut b, &o, None, &mut fdummy, None);
             }
             _ => {}
         }
@@ -1569,7 +1611,7 @@ fn main() {
                             break;
                         }
                         if i < ev_chunks.len() {
-                            prof!(0, parse_events(ev_chunks[i], &ctx, shift, &mut b, o, fa, &mut fb));
+                            prof!(0, parse_events(ev_chunks[i], &ctx, shift, &mut b, o, fa, &mut fb, if fa.is_none() { link_cell.get() } else { None }));
                         } else {
                             prof!(1, parse_clicks(cl_chunks[i - ev_chunks.len()], &ctx, o, &mut ct, fa, &mut fc));
                             if let Some(lt) = link_cell.get() {
